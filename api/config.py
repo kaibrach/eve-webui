@@ -343,12 +343,14 @@ def resolve_model_provider(model_id: str):
 
     if '/' in model_id:
         prefix, bare = model_id.split('/', 1)
-        # If prefix matches config provider, strip it
+        # If prefix matches config provider, strip it and use that provider directly
         if config_provider and prefix == config_provider:
             return bare, config_provider, config_base_url
-        # If prefix is a known direct-API provider, use it
-        # (base_url only applies when matching config provider)
-        if prefix in _PROVIDER_MODELS:
+        # If the config provider is openrouter (or unset/None), pass the full
+        # provider/model string through -- OpenRouter uses this as its model ID.
+        # Only strip the prefix and switch to a direct-API provider when the
+        # config is explicitly set to that direct provider.
+        if config_provider and config_provider != 'openrouter' and prefix in _PROVIDER_MODELS:
             return bare, prefix, None
 
     return model_id, config_provider, config_base_url

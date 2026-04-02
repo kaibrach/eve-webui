@@ -140,7 +140,6 @@ def handle_get(handler, parsed):
 
     # ── Cron API (GET) ──
     if parsed.path == '/api/crons':
-        sys.path.insert(0, str(Path(__file__).parent.parent))
         from cron.jobs import list_jobs
         return j(handler, {'jobs': list_jobs(include_disabled=True)})
 
@@ -345,8 +344,14 @@ def handle_post(handler, parsed):
     if parsed.path == '/api/projects/create':
         try: require(body, 'name')
         except ValueError as e: return bad(handler, str(e))
+        import re as _re
+        name = body['name'].strip()[:128]
+        if not name: return bad(handler, 'name required')
+        color = body.get('color')
+        if color and not _re.match(r'^#[0-9a-fA-F]{3,8}$', color):
+            return bad(handler, 'Invalid color format')
         projects = load_projects()
-        proj = {'project_id': uuid.uuid4().hex[:12], 'name': body['name'], 'color': body.get('color'), 'created_at': time.time()}
+        proj = {'project_id': uuid.uuid4().hex[:12], 'name': name, 'color': color, 'created_at': time.time()}
         projects.append(proj)
         save_projects(projects)
         return j(handler, {'ok': True, 'project': proj})
@@ -354,11 +359,16 @@ def handle_post(handler, parsed):
     if parsed.path == '/api/projects/rename':
         try: require(body, 'project_id', 'name')
         except ValueError as e: return bad(handler, str(e))
+        import re as _re
         projects = load_projects()
         proj = next((p for p in projects if p['project_id'] == body['project_id']), None)
         if not proj: return bad(handler, 'Project not found', 404)
-        proj['name'] = body['name']
-        if 'color' in body: proj['color'] = body['color']
+        proj['name'] = body['name'].strip()[:128]
+        if 'color' in body:
+            color = body['color']
+            if color and not _re.match(r'^#[0-9a-fA-F]{3,8}$', color):
+                return bad(handler, 'Invalid color format')
+            proj['color'] = color
         save_projects(projects)
         return j(handler, {'ok': True, 'project': proj})
 
@@ -594,7 +604,6 @@ def _handle_cron_recent(handler, parsed):
     qs = parse_qs(parsed.query)
     since = float(qs.get('since', ['0'])[0])
     try:
-        sys.path.insert(0, str(Path(__file__).parent.parent))
         from cron.jobs import list_jobs
         jobs = list_jobs(include_disabled=True)
         completions = []
