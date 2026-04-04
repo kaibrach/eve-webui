@@ -129,7 +129,7 @@
   .topbar-chips{display:flex;gap:6px;align-items:center;flex-shrink:0;}
   .chip{font-size:11px;padding:4px 10px;border-radius:999px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,.1);color:var(--muted);font-weight:500;}
   .chip.model{color:var(--blue);border-color:rgba(124,185,255,0.35);background:rgba(124,185,255,0.1);}
-  .messages{flex:1;overflow-y:auto;display:flex;flex-direction:column;min-height:0;}
+  .messages{flex:1;overflow-y:auto;display:flex;flex-direction:column;min-height:0;position:relative;z-index:0;}
   .messages-inner{max-width:800px;margin:0 auto;width:100%;padding:20px 24px 32px;display:flex;flex-direction:column;}
   .msg-row{padding:10px 0;}
   .msg-row+.msg-row{border-top:none;}
@@ -692,6 +692,7 @@ body.resizing{user-select:none;cursor:col-resize;}
 /* ── CLI session items in sidebar ── */
 .session-item.cli-session {
   border-left-color: var(--gold);
+  padding-right: 36px; /* make room for session-actions overlay */
 }
 .session-item.cli-session::after {
   content: 'cli';
@@ -701,6 +702,7 @@ body.resizing{user-select:none;cursor:col-resize;}
   letter-spacing: .04em;
   color: var(--gold);
   opacity: .5;
-  margin-left: 4px;
+  margin-left: auto;
   flex-shrink: 0;
+  pointer-events: none; /* don't block clicks on session-actions beneath */
 }
