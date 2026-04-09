@@ -1059,6 +1059,8 @@ async function saveSettings(andClose){
       await api('/api/settings',{method:'POST',body:JSON.stringify({...body,_set_password:pw.trim()})});
       window._sendKey=sendKey||'enter';
       window._showTokenUsage=showTokenUsage;
+      window._soundEnabled=body.sound_enabled;
+      window._notificationsEnabled=body.notifications_enabled;
       showToast('Settings saved (password set — login now required)');
       _settingsDirty=false; _settingsThemeOnOpen=theme;
       const bar=$('settingsUnsavedBar'); if(bar) bar.style.display='none';

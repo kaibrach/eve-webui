@@ -379,6 +379,7 @@ function playNotificationSound(){
     gain.gain.setValueAtTime(0.3,ctx.currentTime);
     gain.gain.exponentialRampToValueAtTime(0.01,ctx.currentTime+0.3);
     osc.start(ctx.currentTime);osc.stop(ctx.currentTime+0.3);
+    osc.onended=()=>ctx.close();
   }catch(e){console.warn('Notification sound failed:',e);}
 }
 
