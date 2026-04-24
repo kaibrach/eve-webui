@@ -5,6 +5,11 @@
 ### Fixed
 - **Reasoning chip now appears after the model chip** in the composer toolbar — model is a more fundamental choice and should be stable in position regardless of whether reasoning is active. Order: Profile → Workspace → Model → Reasoning. (`static/index.html`)
 
+## v0.50.197 — 2026-04-24
+
+### Changed
+- **Complete Traditional Chinese (zh-Hant) translations** — adds full zh-Hant locale coverage (300+ translation entries) across all UI sections. Fixes mixed Simplified/Traditional character inconsistency in the existing zh translations. Also adds English-fallback entries to zh/ru/es/de for newly-added session management and settings keys (session_archive, session_pin, session_duplicate, settings_dropdown_*, etc.). (`static/i18n.js`) By @ruxme. [#954]
+
 ## v0.50.196 — 2026-04-24
 
 ### Fixed
