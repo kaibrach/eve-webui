@@ -196,3 +196,26 @@ class TestCustomProvidersModelsDict:
         # No cross-contamination
         assert "model-b1" not in ids_a
         assert "model-a1" not in ids_b
+
+    def test_named_custom_models_are_prefixed_when_not_active_provider(self):
+        """Named custom provider models must carry a routing prefix when DeepSeek is active."""
+        result = _models_with_cfg(
+            model_cfg={"provider": "deepseek", "default": "deepseek-v4-pro"},
+            custom_providers=[
+                {
+                    "name": "sub2api",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "gpt-5.4-mini",
+                    "models": {
+                        "gpt-5.4-mini": {},
+                        "gpt-5.4": {},
+                    },
+                }
+            ],
+        )
+        group = _group_for(result, "sub2api")
+        assert group is not None, "sub2api group missing"
+        assert group["provider_id"] == "custom:sub2api"
+        ids = [m["id"] for m in group["models"]]
+        assert "@custom:sub2api:gpt-5.4-mini" in ids
+        assert "@custom:sub2api:gpt-5.4" in ids

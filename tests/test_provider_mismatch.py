@@ -751,6 +751,49 @@ def test_issue1253_duplicate_model_id_active_provider_hint_preserved(monkeypatch
     )
 
 
+def test_named_custom_provider_hint_with_colon_is_preserved(monkeypatch):
+    """@custom:name:model must survive chat/start normalization for WebUI routing."""
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "get_available_models",
+        lambda: {
+            "active_provider": "deepseek",
+            "default_model": "deepseek-v4-pro",
+            "groups": [
+                {
+                    "provider": "sub2api",
+                    "provider_id": "custom:sub2api",
+                    "models": [
+                        {
+                            "id": "@custom:sub2api:gpt-5.4-mini",
+                            "label": "GPT 5.4 Mini",
+                        }
+                    ],
+                },
+                {
+                    "provider": "DeepSeek",
+                    "provider_id": "deepseek",
+                    "models": [
+                        {
+                            "id": "deepseek-v4-pro",
+                            "label": "DeepSeek V4 Pro",
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    effective, changed = routes._resolve_compatible_session_model(
+        "@custom:sub2api:gpt-5.4-mini"
+    )
+
+    assert changed is False
+    assert effective == "@custom:sub2api:gpt-5.4-mini"
+
+
 def test_stale_at_provider_model_falls_back_when_family_mismatches(monkeypatch):
     """Unroutable @provider:model should not invent a bare model for another family."""
     import api.routes as routes

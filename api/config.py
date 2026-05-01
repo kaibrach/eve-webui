@@ -1966,8 +1966,11 @@ def get_available_models() -> dict:
                             if _slug not in _named_custom_groups:
                                 _named_custom_groups[_slug] = (_cp_name, [])
                             detected_providers.add(_slug)
+                            _cp_option_id = _cp_model
+                            if active_provider != _slug and not _cp_option_id.startswith("@"):
+                                _cp_option_id = f"@{_slug}:{_cp_option_id}"
                             _named_custom_groups[_slug][1].append(
-                                {"id": _cp_model, "label": _cp_label}
+                                {"id": _cp_option_id, "label": _cp_label}
                             )
                         else:
                             auto_detected_models.append({"id": _cp_model, "label": _cp_label})
