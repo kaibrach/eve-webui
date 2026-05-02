@@ -15,8 +15,12 @@ const LOCALES = {
     mic_no_speech: 'No speech detected. Try again.',
     mic_network: 'Speech recognition unavailable.',
     mic_error: 'Voice input error: ',
+    // Composer voice buttons (#1488 — distinct labels for dictation vs voice mode)
+    voice_dictate: 'Dictate',
+    voice_dictate_active: 'Stop dictation',
+    voice_mode_toggle: 'Voice mode',
+    voice_mode_toggle_active: 'Exit voice mode',
     // Turn-based voice mode (#1333)
-    voice_toggle: 'Voice input',
     voice_listening: 'Listening…',
     voice_speaking: 'Speaking…',
     voice_thinking: 'Thinking…',
@@ -494,6 +498,9 @@ const LOCALES = {
     settings_desc_tts: "Show a speaker button on each assistant message to read it aloud using your browser's speech synthesis.",
     settings_label_tts_auto_read: 'Auto-read responses aloud',
     settings_desc_tts_auto_read: 'Automatically speak each new assistant response when it finishes. Pauses when you start typing.',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',
     settings_label_tts_voice: 'Voice',
     settings_desc_tts_voice: "Preferred voice. Populated from your browser's available voices.",
     settings_label_tts_rate: 'Speech rate',
@@ -887,7 +894,11 @@ const LOCALES = {
     mic_network: '音声認識を利用できません。',
     mic_error: '音声入力エラー: ',
     // Turn-based voice mode (#1333)
-    voice_toggle: '音声入力',
+    // Composer voice buttons (#1488)
+    voice_dictate: 'ディクテーション',
+    voice_dictate_active: 'ディクテーション停止',
+    voice_mode_toggle: '音声モード',
+    voice_mode_toggle_active: '音声モードを終了',
     voice_listening: '聞き取り中…',
     voice_speaking: '発話中…',
     voice_thinking: '考え中…',
@@ -1365,6 +1376,9 @@ const LOCALES = {
     settings_desc_tts: 'アシスタントの各メッセージにスピーカーボタンを表示し、ブラウザの音声合成で読み上げます。',
     settings_label_tts_auto_read: '応答を自動で読み上げ',
     settings_desc_tts_auto_read: '新しいアシスタント応答が完了するたびに自動で読み上げます。入力中は一時停止します。',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'ハンズフリー音声モードのボタン',
+    settings_desc_voice_mode: '音声波形ボタンをディクテーションマイクの隣に表示します。発話の合間に自動送信し、返答を読み上げます。音声認識と TTS の両方をサポートするブラウザが必要です。',
     settings_label_tts_voice: '声',
     settings_desc_tts_voice: '優先する声。ブラウザで利用可能な声から選択されます。',
     settings_label_tts_rate: '読み上げ速度',
@@ -1756,7 +1770,11 @@ const LOCALES = {
     mic_no_speech: 'Речь не распознана. Попробуйте ещё раз.',
     mic_network: 'Распознавание речи недоступно.',
     mic_error: 'Ошибка ввода речи: ',
-    voice_toggle: 'Голосовой ввод',
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Диктовка',
+    voice_dictate_active: 'Остановить диктовку',
+    voice_mode_toggle: 'Голосовой режим',
+    voice_mode_toggle_active: 'Выйти из голосового режима',
     voice_listening: 'Слушаю…',
     voice_speaking: 'Говорю…',
     voice_thinking: 'Думаю…',
@@ -2517,6 +2535,9 @@ const LOCALES = {
     settings_desc_tts: 'Показать кнопку динамика на сообщениях ассистента',
     settings_label_tts_auto_read: 'Авто-чтение ответов',
     settings_desc_tts_auto_read: 'Автоматически озвучивать ответы ассистента',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Кнопка режима свободных рук',
+    settings_desc_voice_mode: 'Показывать кнопку голосового режима (аудиоволны) рядом с микрофоном диктовки. Hermes автоматически отправляет реплики после паузы и зачитывает ответы вслух. Требуется браузер с поддержкой распознавания речи и TTS.',
     settings_label_tts_voice: 'Голос',
     settings_desc_tts_voice: 'Выберите голос для синтеза речи',
     settings_label_tts_rate: 'Скорость речи',
@@ -3316,6 +3337,9 @@ const LOCALES = {
     settings_desc_tts: 'Mostrar botón de altavoz en mensajes del asistente',
     settings_label_tts_auto_read: 'Leer respuestas automáticamente',
     settings_desc_tts_auto_read: 'Leer en voz alta las respuestas del asistente automáticamente',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',  // TODO: translate
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',  // TODO: translate
     settings_label_tts_voice: 'Voz',
     settings_desc_tts_voice: 'Seleccionar voz para síntesis de voz',
     settings_label_tts_rate: 'Velocidad de voz',
@@ -3358,7 +3382,11 @@ const LOCALES = {
     voice_mode_off: 'Voice mode off',  // TODO: translate
     voice_speaking: 'Speaking…',  // TODO: translate
     voice_thinking: 'Thinking…',  // TODO: translate
-    voice_toggle: 'Voice input',  // TODO: translate
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Dictate',  // TODO: translate
+    voice_dictate_active: 'Stop dictation',  // TODO: translate
+    voice_mode_toggle: 'Voice mode',  // TODO: translate
+    voice_mode_toggle_active: 'Exit voice mode',  // TODO: translate
     subagent_children: 'Subagent sessions',  // TODO: translate
   },
 
@@ -4124,6 +4152,9 @@ const LOCALES = {
     settings_desc_tts: 'Lautsprecher-Symbol auf Assistenten-Nachrichten anzeigen',
     settings_label_tts_auto_read: 'Antworten automatisch vorlesen',
     settings_desc_tts_auto_read: 'Assistenten-Antworten automatisch vorlesen',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',  // TODO: translate
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',  // TODO: translate
     settings_label_tts_voice: 'Stimme',
     settings_desc_tts_voice: 'Stimme für Sprachsynthese auswählen',
     settings_label_tts_rate: 'Sprechgeschwindigkeit',
@@ -4167,7 +4198,11 @@ const LOCALES = {
     voice_mode_off: 'Voice mode off',  // TODO: translate
     voice_speaking: 'Speaking…',  // TODO: translate
     voice_thinking: 'Thinking…',  // TODO: translate
-    voice_toggle: 'Voice input',  // TODO: translate
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Dictate',  // TODO: translate
+    voice_dictate_active: 'Stop dictation',  // TODO: translate
+    voice_mode_toggle: 'Voice mode',  // TODO: translate
+    voice_mode_toggle_active: 'Exit voice mode',  // TODO: translate
     subagent_children: 'Subagent sessions',  // TODO: translate
   },
 
@@ -4928,6 +4963,9 @@ const LOCALES = {
     settings_desc_tts: '在助手消息上显示扬声器按钮',
     settings_label_tts_auto_read: '自动朗读回复',
     settings_desc_tts_auto_read: '自动朗读助手回复',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',  // TODO: translate
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',  // TODO: translate
     settings_label_tts_voice: '语音',
     settings_desc_tts_voice: '选择语音合成声音',
     settings_label_tts_rate: '语速',
@@ -4970,7 +5008,11 @@ const LOCALES = {
     voice_mode_off: 'Voice mode off',  // TODO: translate
     voice_speaking: 'Speaking…',  // TODO: translate
     voice_thinking: 'Thinking…',  // TODO: translate
-    voice_toggle: 'Voice input',  // TODO: translate
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Dictate',  // TODO: translate
+    voice_dictate_active: 'Stop dictation',  // TODO: translate
+    voice_mode_toggle: 'Voice mode',  // TODO: translate
+    voice_mode_toggle_active: 'Exit voice mode',  // TODO: translate
     subagent_children: 'Subagent sessions',  // TODO: translate
   },
 
@@ -5838,6 +5880,9 @@ const LOCALES = {
     settings_desc_tts: '在助手訊息上顯示喇叭按鈕',
     settings_label_tts_auto_read: '自動朗讀回覆',
     settings_desc_tts_auto_read: '自動朗讀助手回覆',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',  // TODO: translate
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',  // TODO: translate
     settings_label_tts_voice: '語音',
     settings_desc_tts_voice: '選擇語音合成聲音',
     settings_label_tts_rate: '語速',
@@ -5881,7 +5926,11 @@ const LOCALES = {
     voice_mode_off: 'Voice mode off',  // TODO: translate
     voice_speaking: 'Speaking…',  // TODO: translate
     voice_thinking: 'Thinking…',  // TODO: translate
-    voice_toggle: 'Voice input',  // TODO: translate
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Dictate',  // TODO: translate
+    voice_dictate_active: 'Stop dictation',  // TODO: translate
+    voice_mode_toggle: 'Voice mode',  // TODO: translate
+    voice_mode_toggle_active: 'Exit voice mode',  // TODO: translate
     subagent_children: 'Subagent sessions',  // TODO: translate
   },
 
@@ -6561,6 +6610,9 @@ const LOCALES = {
     settings_desc_tts: 'Mostrar botão de alto-falante nas mensagens do assistente',
     settings_label_tts_auto_read: 'Ler respostas automaticamente',
     settings_desc_tts_auto_read: 'Ler automaticamente as respostas do assistente',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',  // TODO: translate
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',  // TODO: translate
     settings_label_tts_voice: 'Voz',
     settings_desc_tts_voice: 'Selecionar voz para síntese de voz',
     settings_label_tts_rate: 'Velocidade da fala',
@@ -6603,7 +6655,11 @@ const LOCALES = {
     voice_mode_off: 'Voice mode off',  // TODO: translate
     voice_speaking: 'Speaking…',  // TODO: translate
     voice_thinking: 'Thinking…',  // TODO: translate
-    voice_toggle: 'Voice input',  // TODO: translate
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Dictate',  // TODO: translate
+    voice_dictate_active: 'Stop dictation',  // TODO: translate
+    voice_mode_toggle: 'Voice mode',  // TODO: translate
+    voice_mode_toggle_active: 'Exit voice mode',  // TODO: translate
     subagent_children: 'Subagent sessions',  // TODO: translate
     // login-flow keys (issue #1442)
     sign_out_failed: 'Falha ao sair: ',
@@ -7421,6 +7477,9 @@ const LOCALES = {
     settings_desc_tts: '도움말 메시지에 스피커 버튼 표시',
     settings_label_tts_auto_read: '답변 자동 읽기',
     settings_desc_tts_auto_read: '도움말 답변을 자동으로 읽어줌',
+    // Composer voice-mode pref (#1488)
+    settings_label_voice_mode: 'Hands-free voice mode button',  // TODO: translate
+    settings_desc_voice_mode: 'Show the voice-mode button (audio waveform) next to the dictation mic. Lets you speak naturally — Hermes auto-sends after a pause and reads replies aloud. Requires a browser that supports both speech recognition and TTS.',  // TODO: translate
     settings_label_tts_voice: '음성',
     settings_desc_tts_voice: '음성 합성 음성 선택',
     settings_label_tts_rate: '말 속도',
@@ -7463,7 +7522,11 @@ const LOCALES = {
     voice_mode_off: 'Voice mode off',  // TODO: translate
     voice_speaking: 'Speaking…',  // TODO: translate
     voice_thinking: 'Thinking…',  // TODO: translate
-    voice_toggle: 'Voice input',  // TODO: translate
+    // Composer voice buttons (#1488)
+    voice_dictate: 'Dictate',  // TODO: translate
+    voice_dictate_active: 'Stop dictation',  // TODO: translate
+    voice_mode_toggle: 'Voice mode',  // TODO: translate
+    voice_mode_toggle_active: 'Exit voice mode',  // TODO: translate
     subagent_children: 'Subagent sessions',  // TODO: translate
   },
 };

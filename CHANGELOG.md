@@ -1,5 +1,11 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.271] — 2026-05-02
+
+### Changed (1 self-built PR)
+
+- **Composer voice buttons: distinct icon, distinct labels, opt-in voice mode** (#1488, self-built, closes #1488) — the composer footer rendered two near-identical mic icons whose tooltips both said "Voice input": one was push-to-talk dictation (older feature), the other was turn-based hands-free voice mode (newer). After researching how ChatGPT, Claude, and Gemini handle the same problem, this PR adopts the industry convention: **mic = dictation, audio-waveform = voice mode**. (1) Voice-mode button now uses Lucide's `audio-lines` glyph (six vertical bars of varying height — the universal "two-way voice conversation" icon, also registered in `LI_PATHS` for reuse). (2) Distinct, localized tooltips: `voice_dictate: 'Dictate'` (with `voice_dictate_active: 'Stop dictation'` flip-state) and `voice_mode_toggle: 'Voice mode'` (with `voice_mode_toggle_active: 'Exit voice mode'` flip-state). The legacy `voice_toggle` key (which resolved to "Voice input" in every locale and caused the duplicate-tooltip bug) is removed. (3) Voice mode is now **opt-in** via Settings → Preferences → "Hands-free voice mode button" — default off keeps the composer uncluttered for the broad-majority case (plain dictation only). The dictation mic stays visible by default, unchanged. Toggle is `localStorage`-backed (`hermes-voice-mode-button`), and `panels.js`'s onchange handler calls `window._applyVoiceModePref()` so the audio-waveform button appears/disappears immediately with no reload. 17 new regression tests in `tests/test_issue1488_composer_voice_buttons.py` pin: distinct static + i18n titles, audio-lines glyph shape (≥5 vertical-bar paths, no leftover mic-with-sparkles rect), all 4 new keys in all 9 locales, removal of stale `voice_toggle`, English labels match ChatGPT/Gemini convention, pref gating (no unconditional `display=''` left in boot.js), Settings checkbox + i18n, panels.js wiring, and active-state tooltip flips. Browser-verified end-to-end on port 8789 (default 1 mic / pref-on 2 distinct icons / live re-apply via Settings). (`static/index.html`, `static/icons.js`, `static/i18n.js`, `static/boot.js`, `static/panels.js`, `tests/test_issue1488_composer_voice_buttons.py`)
+
 ## [v0.50.270] — 2026-05-02
 
 ### Fixed (1 contributor PR)

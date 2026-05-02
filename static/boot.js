@@ -236,6 +236,9 @@ $('btnAttach').onclick=()=>$('fileInput').click();
   function _setRecording(on){
     window._micActive=on;
     btn.classList.toggle('recording',on);
+    // Active-state title flips so the tooltip is honest about what
+    // pressing the button will do (#1488).
+    btn.title = on ? t('voice_dictate_active') : t('voice_dictate');
     status.style.display=on?'':'none';
     if(statusText) statusText.textContent=on?'Listening':'Listening';
     if(!on){ _finalText=''; _prefix=''; }
@@ -429,8 +432,21 @@ window._micPendingSend=window._micPendingSend||false;
 
   if(!modeBtn||!bar||!indicator||!label) return;
 
-  // Show the voice mode button — browser supports both STT and TTS
-  modeBtn.style.display='';
+  // Voice-mode button is gated behind a Preferences toggle (#1488).
+  // Default off — keeps the composer footer uncluttered for users who
+  // only need plain dictation. The hands-free conversation feature is
+  // a power-user surface; explicit opt-in avoids the visual confusion
+  // of two near-identical mic icons.
+  function _voiceModePrefEnabled(){
+    try{ return localStorage.getItem('hermes-voice-mode-button')==='true'; }
+    catch(_){ return false; }
+  }
+  function _applyVoiceModePref(){
+    modeBtn.style.display = _voiceModePrefEnabled() ? '' : 'none';
+  }
+  _applyVoiceModePref();
+  // Expose so the settings pane can re-apply immediately on toggle.
+  window._applyVoiceModePref = _applyVoiceModePref;
 
   let _voiceModeActive=false;
   let _voiceModeState='idle'; // idle | listening | thinking | speaking
@@ -643,7 +659,7 @@ window._micPendingSend=window._micPendingSend||false;
   function _activate(){
     _voiceModeActive=true;
     modeBtn.classList.add('active');
-    modeBtn.title=t('voice_mode_active');
+    modeBtn.title=t('voice_mode_toggle_active');
     showToast(t('voice_mode_active'),1500);
     // If the agent is busy, wait — state will be 'thinking' and we'll detect completion
     if(typeof S!=='undefined'&&S.busy){
@@ -660,7 +676,7 @@ window._micPendingSend=window._micPendingSend||false;
     _voiceModeState='idle';
     _voiceModeThinkingSid=null;
     modeBtn.classList.remove('active');
-    modeBtn.title=t('voice_toggle');
+    modeBtn.title=t('voice_mode_toggle');
     bar.style.display='none';
     clearTimeout(_silenceTimer);
     try{ if(_recognition) _recognition.abort(); }catch(_){}
