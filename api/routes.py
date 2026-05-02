@@ -1838,26 +1838,34 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/session/duplicate":
         try:
-            import uuid
-            import time
             sid = body.get("session_id")
             if not sid:
                 return bad(handler, "session_id is required")
 
             session = Session.load(sid)
             if not session:
-                return bad(handler, "Session not found")
+                # 404, not 400 — missing resource, not a malformed request.
+                return bad(handler, "Session not found", status=404)
 
+            # Deep-copy mutable lists so the duplicate is *actually* independent.
+            # `Session.__init__` does `self.messages = messages or []` — plain
+            # assignment, no copy. Without deepcopy, both sessions share the same
+            # list object in memory; appending to one mutates the other.
+            # Items inside `messages` are dicts with mutable values (tool_calls,
+            # content arrays), so a shallow `list(...)` is not enough.
             copied_session = Session(
                 session_id=uuid.uuid4().hex[:12],
                 title=session.title + " (copy)",
                 workspace=session.workspace,
                 model=session.model,
                 model_provider=session.model_provider,
-                messages=session.messages,
-                tool_calls=session.tool_calls,
-                pinned=session.pinned,
-                archived=session.archived,
+                messages=copy.deepcopy(session.messages),
+                tool_calls=copy.deepcopy(session.tool_calls),
+                # Reset ephemeral / per-session-instance flags. Duplicating an
+                # archived conversation should produce a visible (un-archived)
+                # copy; pinned status doesn't transfer either.
+                pinned=False,
+                archived=False,
                 project_id=session.project_id,
                 profile=session.profile,
                 input_tokens=session.input_tokens,
@@ -1872,6 +1880,11 @@ def handle_post(handler, parsed) -> bool:
                 SESSIONS.move_to_end(copied_session.session_id)
                 while len(SESSIONS) > SESSIONS_MAX:
                     SESSIONS.popitem(last=False)
+            # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
+            # accidentally avoided this because `/api/session/rename` calls `s.save()`.
+            # Without this explicit save, the duplicate is in-memory only — if the user
+            # refreshes before sending a turn, the duplicate vanishes.
+            copied_session.save()
 
             return j(handler, {"session": copied_session.compact() | {"messages": copied_session.messages}})
         except Exception as e:

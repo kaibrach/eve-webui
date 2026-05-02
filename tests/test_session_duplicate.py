@@ -104,8 +104,11 @@ def test_duplicate_creates_independent_session():
     assert 'parent_session_id' not in endpoint_code, \
         "Duplicate should NOT set parent_session_id (that would make it a fork)"
 
-    # Verify that messages are copied
-    assert 'messages=session.messages' in endpoint_code or 'messages=copied_session.messages' in endpoint_code, \
+    # Verify that messages are copied (accept both plain assignment and the
+    # corrected deepcopy form added May 2 2026).
+    assert 'messages=session.messages' in endpoint_code or \
+           'messages=copy.deepcopy(session.messages)' in endpoint_code or \
+           'messages=copied_session.messages' in endpoint_code, \
         "Messages should be copied to duplicate"
 
     # Verify that title includes (copy)
@@ -146,8 +149,11 @@ def test_duplicate_session_copies_messages_logic():
     lines = content[duplicate_start:].split('\n')
     endpoint_code = '\n'.join(lines[:30])
 
-    # Verify messages are copied from original session
-    assert 'messages=session.messages' in endpoint_code, \
+    # Verify messages are copied from original session.  Accept either the
+    # plain assignment (insufficient — see test_duplicate_runtime_messages_independence)
+    # or the proper deepcopy form (the May 2 2026 fix).
+    assert 'messages=session.messages' in endpoint_code or \
+           'messages=copy.deepcopy(session.messages)' in endpoint_code, \
         f"Messages should be copied from original. Got: {endpoint_code}"
 
 
@@ -214,9 +220,110 @@ def test_duplicate_session_copies_all_session_properties():
         'workspace=session.workspace',
         'model=session.model',
         'model_provider=session.model_provider',
-        'messages=session.messages',
     ]
 
     for prop in properties_to_check:
         assert prop in construction_block, \
             f"Property should be copied: {prop}. Got: {construction_block[:300]}"
+
+    # `messages` accepts either the plain assignment or the deepcopy form (May 2 2026 fix).
+    assert 'messages=session.messages' in construction_block or \
+           'messages=copy.deepcopy(session.messages)' in construction_block, \
+        f"messages must be copied (plain or deepcopy form). Got: {construction_block[:300]}"
+
+
+
+# ---------------------------------------------------------------------------
+# Runtime tests added May 2 2026 (Opus pre-release follow-up to #1462 review)
+# ---------------------------------------------------------------------------
+
+def test_duplicate_uses_deepcopy_for_messages():
+    """The duplicate must use copy.deepcopy() for messages and tool_calls.
+
+    Static-grep regression test: catches the original bug where
+    `messages=session.messages` was a plain reference assignment, leaving
+    both sessions sharing the same list object in memory.
+    """
+    with open('api/routes.py', 'r', encoding='utf-8') as f:
+        content = f.read()
+    duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
+    assert duplicate_start != -1, "Duplicate endpoint not found"
+    lines = content[duplicate_start:].split('\n')
+    endpoint_code = '\n'.join(lines[:50])
+    assert 'copy.deepcopy(session.messages)' in endpoint_code, \
+        "duplicate must use copy.deepcopy(session.messages) — plain assignment shares list refs"
+    assert 'copy.deepcopy(session.tool_calls)' in endpoint_code, \
+        "duplicate must use copy.deepcopy(session.tool_calls) — plain assignment shares list refs"
+
+
+def test_duplicate_explicitly_persists_to_disk():
+    """The duplicate must call .save() — otherwise it vanishes on refresh.
+
+    Static-grep regression test: pre-fix, the new endpoint never persisted
+    the duplicate to disk. The session sat in SESSIONS only until the user
+    sent a turn (which triggered _handle_chat_start save). Refreshing
+    mid-flow lost the duplicate.
+    """
+    with open('api/routes.py', 'r', encoding='utf-8') as f:
+        content = f.read()
+    duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
+    assert duplicate_start != -1, "Duplicate endpoint not found"
+    lines = content[duplicate_start:].split('\n')
+    endpoint_code = '\n'.join(lines[:50])
+    assert 'copied_session.save()' in endpoint_code, \
+        "duplicate must call .save() explicitly — without it the copy vanishes on refresh"
+
+
+def test_duplicate_resets_pinned_and_archived():
+    """The duplicate must reset pinned/archived to False.
+
+    UX bug: duplicating an archived conversation should produce a visible
+    (un-archived) copy. Inheriting `archived=True` makes the duplicate
+    invisible in the sidebar and users think the operation didn't work.
+    """
+    with open('api/routes.py', 'r', encoding='utf-8') as f:
+        content = f.read()
+    duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
+    assert duplicate_start != -1, "Duplicate endpoint not found"
+    lines = content[duplicate_start:].split('\n')
+    endpoint_code = '\n'.join(lines[:50])
+    # Both must be hard-coded to False, NOT inherited from `session.pinned`/`session.archived`
+    assert 'pinned=False' in endpoint_code, \
+        "duplicate must reset pinned=False — duplicating shouldn't propagate pin state"
+    assert 'archived=False' in endpoint_code, \
+        "duplicate must reset archived=False — archived duplicates are invisible in the sidebar"
+    # Negative: the old (buggy) `pinned=session.pinned` form must not still be there
+    assert 'pinned=session.pinned' not in endpoint_code, \
+        "duplicate must NOT inherit pinned from source session"
+    assert 'archived=session.archived' not in endpoint_code, \
+        "duplicate must NOT inherit archived from source session"
+
+
+def test_duplicate_returns_404_when_session_not_found():
+    """Missing session must be 404, not 400.
+
+    Pre-fix, `bad(handler, "Session not found")` defaulted to status=400.
+    A missing resource is conceptually 404, not "malformed request".
+    """
+    with open('api/routes.py', 'r', encoding='utf-8') as f:
+        content = f.read()
+    duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
+    assert duplicate_start != -1, "Duplicate endpoint not found"
+    lines = content[duplicate_start:].split('\n')
+    endpoint_code = '\n'.join(lines[:50])
+    assert 'bad(handler, "Session not found", status=404)' in endpoint_code, \
+        "missing session must return status=404, not the default 400"
+
+
+def test_duplicate_local_imports_removed():
+    """Style: `import uuid` and `import time` should not be re-imported inside
+    the handler — both are already at the top of routes.py."""
+    with open('api/routes.py', 'r', encoding='utf-8') as f:
+        content = f.read()
+    duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
+    assert duplicate_start != -1, "Duplicate endpoint not found"
+    # Only check the next ~10 lines — the local imports were right at the top of the handler
+    lines = content[duplicate_start:].split('\n')
+    handler_top = '\n'.join(lines[:10])
+    assert '            import uuid' not in handler_top, "redundant `import uuid` inside handler"
+    assert '            import time' not in handler_top, "redundant `import time` inside handler"
