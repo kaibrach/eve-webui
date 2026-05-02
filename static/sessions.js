@@ -369,6 +369,12 @@ async function loadSession(sid){
     if (_loadingSessionId === sid) _loadingSessionId = null;
     return;
   }
+  // Guard: api() may have redirected (401) and returned undefined; in that case
+  // the browser is already navigating away, so abort the rest of this flow.
+  if (!data) {
+    if (_loadingSessionId === sid) _loadingSessionId = null;
+    return;
+  }
   // Stale response? A newer loadSession() call has already started (#1060).
   if (_loadingSessionId !== sid) return;
   S.session=data.session;
@@ -561,6 +567,8 @@ async function _ensureMessagesLoaded(sid) {
   }
   // Fetch session messages with a tail window for fast initial load.
   const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}`);
+  // Guard: api() may have redirected (401) and returned undefined.
+  if (!data || !data.session) return;
   _messagesTruncated = !!data.session._messages_truncated;
   _oldestIdx = data.session._messages_offset || 0;
   const msgs = (data.session.messages || []).filter(m => m && m.role);
@@ -601,7 +609,8 @@ async function _loadOlderMessages() {
   _loadingOlder = true;
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`);
-    // Cancellation guards:
+    // Guard: api() may have redirected (401) and returned undefined.
+    if (!data || !data.session) { _loadingOlder = false; return; }
     //  - response shape sane
     //  - the active session is still the one we issued the request for.
     //    Compare against S.session.session_id, NOT _loadingSessionId — the
@@ -646,6 +655,8 @@ async function _ensureAllMessagesLoaded() {
   if (!_messagesTruncated || !S.session) return;
   const sid = S.session.session_id;
   const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`);
+  // Guard: api() may have redirected (401) and returned undefined.
+  if (!data || !data.session) return;
   const msgs = (data.session.messages || []).filter(m => m && m.role);
   S.messages = msgs;
   _messagesTruncated = false;

@@ -575,9 +575,10 @@ function _positionModelDropdown(){
   const chip=$('composerModelChip');
   const mobileAction=$('composerMobileModelAction');
   const footer=document.querySelector('.composer-footer');
-  if(!dd||!chip||!footer) return;
+  if(!dd||!footer) return;
   const panel=$('composerMobileConfigPanel');
-  const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
+  const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:(chip&&chip.offsetParent?chip:mobileAction);
+  if(!anchor) return;
   const chipRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
   let left=chipRect.left-footerRect.left;
