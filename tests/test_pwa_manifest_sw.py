@@ -57,6 +57,25 @@ class TestServiceWorker:
             "handler at /sw.js to replace with WEBUI_VERSION at request time"
         )
 
+    def test_sw_js_has_no_merge_conflict_markers(self):
+        """Regression guard for v0.50.279 stage build: a leftover git conflict
+        marker in static/sw.js made the file fail to parse as JavaScript even
+        though the substring-based source-string tests still passed (the
+        ``__WEBUI_VERSION__`` token was present, just inside the conflict block).
+
+        A broken sw.js means the install handler throws on script load → SW
+        never reaches activated state → old SW keeps controlling the page →
+        every "old SW deletes other caches" guarantee is forfeited and frontend
+        cache-bust pathways silently break. Caught by Opus advisor pre-merge,
+        ship blocked. This test would have caught it too.
+        """
+        src = SW.read_text(encoding="utf-8")
+        for marker in ("<<<<<<<", "=======\n", ">>>>>>>"):
+            assert marker not in src, (
+                f"static/sw.js contains conflict marker {marker!r}; "
+                "the merge resolution did not actually land. Reject ship."
+            )
+
     def test_sw_bypasses_api_and_stream(self):
         src = SW.read_text(encoding="utf-8")
         assert "/api/" in src, "SW must bypass /api/* (no cached auth/session responses)"
