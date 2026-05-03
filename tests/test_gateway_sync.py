@@ -208,6 +208,41 @@ def test_gateway_sessions_appear_when_enabled():
         post('/api/settings', {'show_cli_sessions': False})
 
 
+def test_webui_state_db_session_without_sidecar_appears_when_agent_sessions_enabled():
+    """Regression: WebUI-origin rows in state.db can recover missing JSON sidecars."""
+    conn = _ensure_state_db()
+    sid = 'webui_state_only_001'
+    try:
+        _insert_agent_session_row(
+            conn,
+            session_id=sid,
+            source='webui',
+            title='Recovered WebUI Session',
+            model='openai/gpt-5',
+            messages=2,
+        )
+
+        post('/api/settings', {'show_cli_sessions': True})
+
+        data, status = get('/api/sessions')
+        assert status == 200
+        sessions = data.get('sessions', [])
+        recovered = [s for s in sessions if s.get('session_id') == sid]
+        assert len(recovered) == 1, (
+            "WebUI-origin sessions that exist in state.db but have no JSON sidecar "
+            "should be surfaced through the agent-session bridge for recovery."
+        )
+        assert recovered[0].get('source_tag') == 'webui'
+        assert recovered[0].get('is_cli_session') is True
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
+
+
 def test_gateway_sessions_without_messages_are_hidden_from_sidebar():
     """Regression: empty agent session rows must not appear as broken sidebar entries."""
     conn = _ensure_state_db()

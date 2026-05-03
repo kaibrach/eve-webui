@@ -214,9 +214,9 @@ def read_importable_agent_session_rows(
     db_path: Path,
     limit: int = 200,
     log=None,
-    exclude_sources: tuple[str, ...] | None = ("cron",),
+    exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
 ) -> list[dict]:
-    """Return non-WebUI agent sessions projected as importable conversations.
+    """Return agent sessions projected as importable conversations.
 
     Hermes Agent can create rows in ``state.db.sessions`` before a session has
     any messages, and long conversations can be split into compression-linked
@@ -256,7 +256,7 @@ def read_importable_agent_session_rows(
         ended_expr = _optional_col('ended_at', session_cols)
         end_reason_expr = _optional_col('end_reason', session_cols)
 
-        where_clauses = ["s.source IS NOT NULL", "s.source != 'webui'"]
+        where_clauses = ["s.source IS NOT NULL"]
         params: list[str] = []
         if exclude_sources:
             excluded = tuple(str(source) for source in exclude_sources if source)
