@@ -1,5 +1,18 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.278] — 2026-05-03
+
+### Added (1 PR — splices best of #1497 + #1513)
+
+- **Sidebar "Unassigned" filter chip** (self-built, splices contributor PRs #1497 by @Thanatos-Z and #1513 by @AlexeyDsov; both contributors credited via `Co-authored-by` trailers on the merge commit) — adds a new chip to the project filter bar in the session sidebar. Clicking it filters the visible sessions to those with no `project_id` assigned. **First-principles synthesis** of both contributor approaches: (1) **Sentinel state** from #1497 (`NO_PROJECT_FILTER = '__none__'` constant on the existing `_activeProject` variable rather than a parallel `_showNoneProject` boolean from #1513) — single state variable, no two-state-machine ambiguity, "All" handler resets one variable, no risk of "All" + "Unassigned" both reading active. UUID hex collision impossible (`api/models.py:923` and `api/routes.py:2672` both use `uuid.uuid4().hex[:12]`, no underscores). (2) **Conditional rendering** from #1497 — chip only appears when `hasUnprojected = profileFiltered.some(s => !s.project_id)` is true, so the project-bar stays uncluttered in the common case where every session is organized. The project-bar itself now also renders when there are unassigned sessions even with no projects (was previously gated on `_allProjects.length > 0` alone). (3) **Dashed-border visual** from #1497 (`.project-chip.no-project{border-style:dashed;}`) reads as a meta-filter rather than another project. (4) **"Unassigned" label** (new) is clearer than #1497's "No project" (sounds like a status filter) or #1513's "None" (ambiguous — none of what?). Matches conventional file-manager / task-tracker UX. Hover tooltip elaborates: "Show conversations not yet assigned to a project." (5) **Branched empty-state copy** from #1497 ("No unassigned sessions." vs the generic "No sessions in this project yet."). 7 regression tests in `tests/test_sidebar_unassigned_filter.py` pin every contract: sentinel constant declared, filter logic uses `!s.project_id` when sentinel is active, chip only renders when relevant, label and click handler, dashed-border treatment, branched empty-state copy, and the "All" chip handler resets `_activeProject` to null (catches a regression toward a parallel-boolean design).
+
+### Notes
+
+- 3929 → **3936** tests passing (+7 regression tests).
+- Pre-release Opus advisor pass: SHIP AS-IS. Verified sentinel collision impossible, stale-active-filter on project delete safe (sentinel never equals a real project_id), CSS specificity has no conflict (active chip = dashed border + accent color), source-string tests match the sibling-feature pattern. One non-blocking edge case (stuck filter when zero projects + zero unassigned, recoverable via page reload) explicitly deferred per Opus advice — too narrow to justify pre-merge work.
+- Both contributor PRs (#1497, #1513) remain open and unaffected — this PR specifically supersedes only the "no project filter" sub-feature of each. #1497's other changes (sticky controls, batch-select repositioning) still need their own UX review pass; #1513's right-click context menu was intentionally dropped because "rename/delete no project" isn't a meaningful action.
+- Live verified at port 8789 with seeded data (5 projects + 77 sessions, ~73 unassigned in the active profile): chip toggles correctly between filters, dashed border present per `getComputedStyle`, active state applies the accent treatment.
+
 ## [v0.50.277] — 2026-05-03
 
 ### Fixed (1 PR — self-built, supersedes contributor PR #1511)
