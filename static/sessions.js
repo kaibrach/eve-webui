@@ -1768,6 +1768,34 @@ function _activeSessionIdForSidebar(){
   return null;
 }
 
+function upsertActiveSessionForLocalTurn({title='', messageCount=0, timestampMs=Date.now()}={}){
+  if(!S.session||!S.session.session_id) return;
+  const sid=S.session.session_id;
+  const nowSec=Math.floor((Number(timestampMs)||Date.now())/1000);
+  const localCount=Array.isArray(S.messages)?S.messages.length:0;
+  const count=Math.max(Number(S.session.message_count||0),Number(messageCount||0),localCount,1);
+  S.session.message_count=count;
+  S.session.last_message_at=nowSec;
+  S.session.updated_at=nowSec;
+  if((S.session.title==='Untitled'||!S.session.title)&&title){
+    S.session.title=title;
+  }
+  const existingIdx=_allSessions.findIndex(s=>s&&s.session_id===sid);
+  const row={
+    ...S.session,
+    session_id:sid,
+    title:S.session.title||title||'New chat',
+    message_count:count,
+    last_message_at:nowSec,
+    updated_at:nowSec,
+    profile:S.session.profile||S.activeProfile||'default',
+    is_streaming:true,
+  };
+  if(existingIdx>=0) _allSessions[existingIdx]={..._allSessions[existingIdx],...row};
+  else _allSessions.unshift(row);
+  renderSessionListFromCache();
+}
+
 function renderSessionListFromCache(){
   // Don't re-render while user is actively renaming a session (would destroy the input)
   if(_renamingSid) return;

@@ -177,6 +177,9 @@ async function send(){
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
   S.messages.push(userMsg);renderMessages();appendThinking();setBusy(true);
+  if(typeof upsertActiveSessionForLocalTurn==='function'){
+    upsertActiveSessionForLocalTurn({title:displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
+  }
   INFLIGHT[activeSid]={messages:[...S.messages],uploaded:uploadedNames,toolCalls:[]};
   if(typeof saveInflightState==='function'){
     saveInflightState(activeSid,{streamId:null,messages:INFLIGHT[activeSid].messages,uploaded:uploadedNames,toolCalls:[]});
@@ -193,13 +196,18 @@ async function send(){
     const provisionalTitle=displayText.slice(0,64);
     S.session.title=provisionalTitle;
     syncTopbar();
-    // Persist it and refresh the sidebar now -- don't wait for done
+    // Persist it in the background; keep the optimistic sidebar cache as the
+    // immediate source of truth until /api/chat/start saves pending state.
     api('/api/session/rename',{method:'POST',body:JSON.stringify({
       session_id:activeSid, title:provisionalTitle
     })}).catch(()=>{});  // fire-and-forget, server refines on done
-    renderSessionList();  // session appears in sidebar immediately
+    if(typeof upsertActiveSessionForLocalTurn==='function'){
+      upsertActiveSessionForLocalTurn({title:provisionalTitle,messageCount:S.messages.length,timestampMs:Date.now()});
+    }else if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+  } else if(typeof upsertActiveSessionForLocalTurn==='function'){
+    upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
   } else {
-    renderSessionList();  // ensure it's visible even if already titled
+    renderSessionListFromCache();  // ensure it's visible even if already titled
   }
 
   // Start the agent via POST, get a stream_id back
@@ -229,6 +237,9 @@ async function send(){
     S.activeStreamId = streamId;
     if(S.session&&S.session.session_id===activeSid){
       S.session.active_stream_id = streamId;
+    }
+    if(typeof upsertActiveSessionForLocalTurn==='function'){
+      upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
     }
     markInflight(activeSid, streamId);
     if(typeof saveInflightState==='function'){
