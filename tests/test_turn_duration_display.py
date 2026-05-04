@@ -21,6 +21,14 @@ def test_streaming_done_payload_includes_backend_turn_duration():
         "Turn duration should be measured from the persisted pending_started_at "
         "start time, not only from browser-local state."
     )
+    assert "if _pending_started_at is not None else time.time()" in STREAMING_PY, (
+        "The fallback should preserve explicit timestamp values and only use now "
+        "when pending_started_at is absent."
+    )
+    assert "recovered/legacy flows" in STREAMING_PY, (
+        "The missing-start fallback should be documented so it is not mistaken "
+        "for the primary timing path."
+    )
     assert "_turnDuration" in STREAMING_PY, (
         "The measured duration should be persisted on the assistant message so "
         "it survives reload after the SSE stream settles."
