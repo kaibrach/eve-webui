@@ -1796,6 +1796,32 @@ function upsertActiveSessionForLocalTurn({title='', messageCount=0, timestampMs=
   renderSessionListFromCache();
 }
 
+function clearOptimisticSessionStreaming(sid){
+  sid=sid||(S.session&&S.session.session_id)||'';
+  if(!sid) return;
+  if(S.session&&S.session.session_id===sid){
+    S.session.active_stream_id=null;
+    S.activeStreamId=null;
+  }
+  if(Array.isArray(_allSessions)){
+    const idx=_allSessions.findIndex(s=>s&&s.session_id===sid);
+    if(idx>=0){
+      _allSessions[idx]={
+        ..._allSessions[idx],
+        active_stream_id:null,
+        pending_user_message:null,
+        pending_started_at:null,
+        is_streaming:false,
+      };
+    }
+  }
+  if(typeof _sessionStreamingById!=='undefined'&&_sessionStreamingById&&typeof _sessionStreamingById.set==='function'){
+    _sessionStreamingById.set(sid,false);
+  }
+  if(typeof _forgetObservedStreamingSession==='function') _forgetObservedStreamingSession(sid);
+  renderSessionListFromCache();
+}
+
 function renderSessionListFromCache(){
   // Don't re-render while user is actively renaming a session (would destroy the input)
   if(_renamingSid) return;

@@ -177,6 +177,8 @@ async function send(){
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
   S.messages.push(userMsg);renderMessages();appendThinking();setBusy(true);
+  // First optimistic pass: make the local user turn visible before /api/chat/start
+  // can save pending state on the server.
   if(typeof upsertActiveSessionForLocalTurn==='function'){
     upsertActiveSessionForLocalTurn({title:displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
   }
@@ -202,6 +204,8 @@ async function send(){
       session_id:activeSid, title:provisionalTitle
     })}).catch(()=>{});  // fire-and-forget, server refines on done
     if(typeof upsertActiveSessionForLocalTurn==='function'){
+      // Second optimistic pass: carry the provisional title into the cached row
+      // without re-fetching /api/sessions before pending state exists server-side.
       upsertActiveSessionForLocalTurn({title:provisionalTitle,messageCount:S.messages.length,timestampMs:Date.now()});
     }else if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
   } else if(typeof upsertActiveSessionForLocalTurn==='function'){
@@ -239,6 +243,8 @@ async function send(){
       S.session.active_stream_id = streamId;
     }
     if(typeof upsertActiveSessionForLocalTurn==='function'){
+      // Third optimistic pass: stream_id is now known, so the row can reconcile
+      // against real active-stream metadata before the background refresh lands.
       upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
     }
     markInflight(activeSid, streamId);
@@ -279,6 +285,9 @@ async function send(){
     if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true, 'terminal');
     S.messages.push({role:'assistant',content:`**Error:** ${errMsg}`});
     _queueDrainSid=activeSid;renderMessages();setBusy(false);setComposerStatus(`Error: ${errMsg}`);
+    if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
+    // Reconcile with server truth after immediately clearing the optimistic spinner.
+    if(typeof renderSessionList==='function') void renderSessionList();
     return;
   }
 

@@ -45,6 +45,36 @@ class TestSidebarFirstTurnVisibility:
             "Optimistic row should render as streaming until the backend reconciles."
         )
 
+    def test_messages_comments_document_why_each_optimistic_upsert_stays_separate(self):
+        src = read("static/messages.js")
+        assert "First optimistic pass" in src and "before /api/chat/start" in src
+        assert "Second optimistic pass" in src and "provisional title" in src
+        assert "Third optimistic pass" in src and "stream_id is now known" in src
+
+    def test_chat_start_failure_clears_optimistic_streaming_state(self):
+        messages = read("static/messages.js")
+        catch_start = messages.index("}catch(e){", messages.index("api('/api/chat/start'"))
+        failure_start = messages.index("S.messages.push({role:'assistant',content:`**Error:** ${errMsg}`});", catch_start)
+        catch_body = messages[failure_start:messages.index("return;", failure_start)]
+        assert "setBusy(false)" in catch_body, "chat/start failure must leave the active pane idle"
+        assert "clearOptimisticSessionStreaming(activeSid)" in catch_body, (
+            "If /api/chat/start fails after the optimistic sidebar upsert, the cached row "
+            "must drop its streaming spinner immediately instead of waiting for polling."
+        )
+        assert "void renderSessionList()" in catch_body, (
+            "After clearing the optimistic spinner locally, fetch /api/sessions to reconcile "
+            "with whatever the server persisted before failing."
+        )
+
+        sessions = read("static/sessions.js")
+        assert "function clearOptimisticSessionStreaming" in sessions
+        clear_start = sessions.index("function clearOptimisticSessionStreaming")
+        clear_end = sessions.index("function renderSessionListFromCache", clear_start)
+        clear_body = sessions[clear_start:clear_end]
+        assert "is_streaming:false" in clear_body.replace(" ", "")
+        assert "active_stream_id:null" in clear_body.replace(" ", "")
+        assert "_sessionStreamingById.set(sid,false)" in clear_body.replace(" ", "")
+
     def test_backend_compact_counts_pending_first_turn_as_visible(self):
         src = read("api/models.py")
         compact = src[src.index("def compact"):src.index("def _get_profile_home")]
