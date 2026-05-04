@@ -15,7 +15,6 @@ from typing import Any
 from api.config import (
     _PROVIDER_DISPLAY,
     _PROVIDER_MODELS,
-    _get_config_path,
     _save_yaml_config_file,
     get_config,
     invalidate_models_cache,

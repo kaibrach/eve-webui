@@ -117,8 +117,37 @@ def _detect_webui_version() -> str:
     return 'unknown'
 
 
+def _detect_agent_version() -> str:
+    """Detect the running Hermes Agent version for UI display."""
+    if _AGENT_DIR is None:
+        return 'not detected'
+
+    version_file = Path(_AGENT_DIR) / "VERSION"
+    try:
+        if version_file.exists():
+            text = version_file.read_text(encoding='utf-8').strip()
+            if text:
+                return text
+    except Exception:
+        pass
+
+    # Fallback: infer from git describe when the checkout exists but no VERSION
+    # file is available (common in source checkouts and developer environments).
+    if not Path(_AGENT_DIR).exists():
+        return 'not detected'
+    # Symmetric with _detect_webui_version() above — `--dirty` flags a
+    # locally-modified checkout so operators can see when their agent has
+    # uncommitted changes vs a clean tag. Per Opus advisor on stage-293.
+    out, ok = _run_git(['describe', '--tags', '--always', '--dirty'], _AGENT_DIR, timeout=3)
+    if ok and out:
+        return out
+
+    return 'not detected'
+
+
 # Resolved once at import time — tags cannot change without a process restart.
 WEBUI_VERSION: str = _detect_webui_version()
+AGENT_VERSION: str = _detect_agent_version()
 
 
 def _split_remote_ref(ref):

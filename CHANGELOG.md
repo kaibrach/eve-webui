@@ -1,5 +1,44 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.293] — 2026-05-04
+
+### Fixed (3 PRs — profile isolation trio + agent version badge + #1597 follow-up)
+
+- **Show Hermes Agent version in Settings → System** (#1606) — added `agent_version` detection for display in System settings (`~/.hermes/hermes-agent/VERSION` preferred, git describe fallback), surfaced it alongside existing `webui_version` in `GET /api/settings`, and updated the System pane badge UI with a labeled Agent pill plus graceful fallback when the agent cannot be detected.
+
+- **`/api/sessions` and `/api/projects` are now scoped to the active profile by default** (closes #1611 + #1614, reported by @stefanpieter) — the WebUI's session list and project list were both global: `/api/sessions` merged WebUI sidecar sessions and CLI/imported sessions and returned all rows regardless of which `hermes_profile` cookie the client sent, and `/api/projects` had no profile awareness whatsoever. Reporter @stefanpieter ran `curl /api/sessions -H 'Cookie: hermes_profile=haku'` against a multi-profile install and got back sessions tagged `haku`, `kinni`, AND `noblepro` — every profile's history visible from every UI. Frontend filtering had a CLI-bypass at `static/sessions.js:1853` (`s.is_cli_session || s.profile === S.activeProfile`) that let every CLI-imported session through regardless of which profile owned it. **Fix:** server-side filter on both endpoints via the active profile; explicit `?all_profiles=1` opt-in for aggregate views; new `_profiles_match()` helper that honours the renamed-root case (`'default'` and a renamed-root display name like `'kinni'` cross-match because they resolve to the same `~/.hermes` home). Project rows now carry a `profile` field stamped at create-time. `/api/projects/{create,rename,delete}` and `/api/session/move` reject ops on cross-profile projects with 404. `ensure_cron_project()` keys lookup by `(name, profile)` so cron-spawned sessions from profile A no longer surface under the cron chip of profile B. One-time migration in `load_projects()` back-tags legacy untagged projects from any session that uses them, falling back to `'default'`. Frontend drops the CLI-session bypass; toggle-on-toggle re-fetches with `?all_profiles=1` rather than slicing client-cached rows.
+
+- **Renamed root profile no longer 404s on switch** (closes #1612, reported by @stefanpieter) — Hermes Agent allows the root/default profile (`~/.hermes` itself) to have a display name other than the legacy literal `'default'`. WebUI hard-coded `if name == 'default':` at five callsites in `api/profiles.py` (`get_active_hermes_home`, `get_hermes_home_for_profile`, `switch_profile`, `delete_profile_api`, sticky-default writeback), so a renamed root (e.g. `'kinni'` with `is_default=True`, `path=~/.hermes`) fell through every check to `_DEFAULT_HERMES_HOME / 'profiles' / 'kinni'` — a directory that doesn't exist. Switching to the renamed root raised `Profile 'kinni' does not exist.` and broke every code path that resolved `~/.hermes` from a profile name. **Fix:** new `_is_root_profile(name)` central helper that consults `list_profiles_api()` for `is_default=True` matches alongside the legacy `'default'` alias. All five callsites now route through it. Memoized with explicit invalidation hooks at every profile mutation (create, delete) so the lookup cost is paid once per cache window. Sticky `active_profile` file write now stores `''` for renamed root (consistent with the existing legacy contract that empty == root) instead of writing the display name and re-resolving wrong on next boot.
+
+- **Provider config cleanup regression test** (#1630 by @Michaelyklam, follow-up to #1597) — pins the late-binding contract introduced in #1597 by removing the now-unused `_get_config_path` import from `api.providers` and adding a dedicated regression test that proves `_clean_provider_key_from_config()` resolves through `api.config._get_config_path()` at call time rather than the stale module-load reference. Belt-and-braces against a future import-cleanup silently reintroducing the original bug class.
+
+### Tests
+
+4142 → **4180 passing** (+38 regression tests across `tests/test_issue1611_session_profile_filtering.py` (11), `tests/test_issue1612_renamed_root_profile.py` (11), `tests/test_issue1614_project_profile_filtering.py` (11), `tests/test_provider_management.py::test_clean_provider_key_uses_late_bound_config_path` (1), and `tests/test_version_badge.py` agent-detect chain (~5)). 0 regressions. Full suite in ~120s.
+
+### Pre-release verification
+
+- **Opus advisor on full stage-293 diff: SHIP verdict.** Two SHOULD-FIX items absorbed in-release per <20-LOC defensive policy: (a) `api/models.py:load_projects()` re-reads from disk inside `_PROJECTS_MIGRATION_LOCK` when `_projects_migrated` is found True post-wait — closes a startup-window staleness race where a thread that read pre-migration could return stale untagged rows after a peer migrated and wrote disk; (b) `_detect_agent_version()` now uses `git describe --tags --always --dirty` for symmetry with `_detect_webui_version()`. One non-blocking client-side filter cross-alias edge case deferred as follow-up issue.
+- Self-built fix (#1629, nesquena-hermes), independent review **APPROVED by nesquena** with comprehensive end-to-end trace, cross-tool verification against fresh agent tarball, security audit, race/state analysis, and 13-row edge-case matrix.
+- 31 dedicated regression tests for #1611/#1612/#1614 invariants. Source-string assertions pin the active-profile guards on `/api/projects/{rename,delete}` and `/api/session/move`.
+- `_is_root_profile` invalidation cycle exercised via test_is_root_profile_invalidation_drops_stale (cache populated, then dropped after simulated profile rename).
+- `ensure_cron_project` per-profile isolation exercised via test_ensure_cron_project_creates_per_profile (two profiles → two distinct project_ids).
+- Cross-alias matching pinned: `_profiles_match('default', 'kinni')` returns True only when `kinni` is `is_default`.
+
+### Opus-applied fixes (absorbed in-release)
+
+**From stage-293 review:**
+
+- **SHOULD-FIX A (project migration startup race)**: `api/models.py:load_projects()` re-reads from disk after acquiring `_PROJECTS_MIGRATION_LOCK` and finding `_projects_migrated=True`. Without this, Thread B that read pre-migration could return stale untagged rows after Thread A migrated and wrote disk — a mutation route on those stale rows could silently overwrite the migration. Window is process-startup-only and very narrow; fix is 8 LOC.
+- **SHOULD-FIX B (agent version `--dirty` symmetry)**: `_detect_agent_version()` now passes `--dirty` to `git describe --tags --always`, matching `_detect_webui_version()`. Operators with locally-modified agent checkouts now see the dirty marker.
+
+**Already absorbed in #1629 (in-PR Opus pre-merge pass before staging):**
+
+- **SHOULD-FIX #1 (renamed-root client cross-alias)**: removed the strict-equality client filter at `static/sessions.js:1853`. Server-side `_profiles_match` cross-aliases `'default'`-tagged rows to a renamed root `'kinni'`; a strict-equality client filter would have rejected them, dropping every legacy session for renamed-root users. Server is now solely authoritative for profile scoping. Same fix applied to the `otherProfileCount` client fallback.
+- **SHOULD-FIX #2 (messaging-source dedupe ordering)**: moved `_keep_latest_messaging_session_per_source(merged)` to AFTER the profile filter at `api/routes.py:2078`. Before: the dedupe ran on the merged-cross-profile list with profile-blind keys, discarding the older profile's row across profiles, then the profile filter scoped to the active profile — leaving zero rows for any messaging identity the active profile shared with another profile. After: filter first, then dedupe within scope.
+- **NIT #3 (migration save-failure)**: `_projects_migrated = True` flag now set only AFTER successful `save_projects()`. A failed save no longer poisons the in-memory state for the rest of process lifetime.
+- **NIT #4 (dead test code)**: cleaned up the dead double-assignment in `test_is_root_profile_invalidation_drops_stale`.
+- **NIT #5 (`_create_profile_fallback` literal-default)**: routed the `clone_from == 'default'` literal in the no-hermes-cli fallback path through `_is_root_profile()` for parity with the other 5 callsites.
 ## [v0.50.292] — 2026-05-04
 
 ### Fixed (12 PRs — multi-tab SSE + subpath routes + cross-source lineage + paste UX + 3 follow-ups)

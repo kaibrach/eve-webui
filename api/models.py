@@ -990,14 +990,90 @@ def title_from(messages, fallback: str='Untitled'):
 
 # ── Project helpers ──────────────────────────────────────────────────────────
 
-def load_projects() -> list:
-    """Load project list from disk. Returns list of project dicts."""
+_PROJECTS_MIGRATION_LOCK = threading.Lock()
+_projects_migrated = False
+
+
+def _backfill_project_profiles_if_needed(projects: list) -> bool:
+    """Tag any legacy untagged projects (`profile` missing) with a sensible default.
+
+    Strategy:
+      1. For each untagged project, look at the sessions assigned to it via
+         the session index. If any session carries a profile, take that
+         profile.  Most installs are single-profile so this picks up the
+         right answer for everyone.
+      2. Otherwise default to 'default'.
+
+    Returns True if any project was mutated. Safe to call repeatedly — once
+    every project is tagged, this is a no-op. Runs at most once per process
+    (cached via the module-level _projects_migrated flag) but the result is
+    persisted so it's a one-time write.
+    """
+    untagged = [p for p in projects if not p.get('profile')]
+    if not untagged:
+        return False
+
+    # Build session_id -> profile map for the untagged project_ids.
+    session_profile_by_project: dict[str, str] = {}
+    if SESSION_INDEX_FILE.exists():
+        try:
+            entries = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+            untagged_ids = {p['project_id'] for p in untagged if p.get('project_id')}
+            for e in entries:
+                pid = e.get('project_id')
+                if pid in untagged_ids and e.get('profile'):
+                    # First session profile wins for the project.
+                    session_profile_by_project.setdefault(pid, e['profile'])
+        except Exception:
+            logger.debug("Failed to read session index for project profile backfill")
+
+    mutated = False
+    for p in untagged:
+        inferred = session_profile_by_project.get(p.get('project_id'), 'default')
+        p['profile'] = inferred
+        mutated = True
+    return mutated
+
+
+def load_projects(*, _migrate: bool = True) -> list:
+    """Load project list from disk. Returns list of project dicts.
+
+    On first call, runs a one-time migration to back-fill the `profile` field
+    on legacy untagged projects (#1614). Disable via `_migrate=False` for
+    callsites that want the raw on-disk shape (test fixtures, e.g.).
+    """
+    global _projects_migrated
     if not PROJECTS_FILE.exists():
         return []
     try:
-        return json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+        projects = json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
     except Exception:
         return []
+    if _migrate and not _projects_migrated:
+        with _PROJECTS_MIGRATION_LOCK:
+            # Re-check inside the lock — another thread may have raced.
+            if _projects_migrated:
+                # Per Opus advisor on stage-293: another thread completed
+                # migration and wrote new state to disk while we waited for
+                # the lock. Our `projects` snapshot is the pre-migration
+                # version; re-read so the caller doesn't see stale untagged
+                # rows (which a mutation route could then write back,
+                # silently overwriting the migration).
+                try:
+                    return json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+                except Exception:
+                    return projects
+            if _backfill_project_profiles_if_needed(projects):
+                try:
+                    save_projects(projects)
+                    _projects_migrated = True
+                except Exception:
+                    logger.debug("Failed to persist project profile backfill")
+                    # Leave _projects_migrated False so a future call retries.
+            else:
+                # Nothing to migrate — already tagged.
+                _projects_migrated = True
+    return projects
 
 def save_projects(projects) -> None:
     """Write project list to disk."""
@@ -1009,20 +1085,46 @@ _CRON_PROJECT_LOCK = threading.Lock()
 
 
 def ensure_cron_project() -> str:
-    """Return the project_id of the system "Cron Jobs" project, creating it if needed.
+    """Return the project_id of the system "Cron Jobs" project for the active profile.
+
+    Each profile gets its own "Cron Jobs" project so cron-spawned sessions in
+    profile A don't surface under the cron chip of profile B (#1614). Lookup
+    keys on (name, profile) — a legacy untagged "Cron Jobs" project (no
+    `profile` field) is treated as belonging to whichever profile first calls
+    this in a given install, then re-tagged.
 
     Thread-safe and idempotent.  Returns a 12-char hex project_id string.
     """
+    from api.profiles import get_active_profile_name, _is_root_profile
+
+    active = get_active_profile_name() or 'default'
     with _CRON_PROJECT_LOCK:
-        for p in load_projects():
-            if p.get('name') == CRON_PROJECT_NAME:
-                return p['project_id']
-        project_id = uuid.uuid4().hex[:12]
         projects = load_projects()
+        # Look for an existing per-profile cron project. Match either an exact
+        # profile tag or the renamed-root alias (a 'default'-tagged project
+        # under a renamed root, or a renamed-root-tagged project under
+        # 'default'). _is_root_profile is the canonical alias check.
+        for p in projects:
+            if p.get('name') != CRON_PROJECT_NAME:
+                continue
+            row_profile = p.get('profile')
+            if row_profile == active:
+                return p['project_id']
+            if _is_root_profile(row_profile or 'default') and _is_root_profile(active):
+                return p['project_id']
+        # Reuse a legacy untagged cron project — back-tag it to the active profile.
+        for p in projects:
+            if p.get('name') == CRON_PROJECT_NAME and not p.get('profile'):
+                p['profile'] = active
+                save_projects(projects)
+                return p['project_id']
+        # Otherwise create a new one tagged with the active profile.
+        project_id = uuid.uuid4().hex[:12]
         projects.append({
             'project_id': project_id,
             'name': CRON_PROJECT_NAME,
             'color': '#6366f1',
+            'profile': active,
             'created_at': time.time(),
         })
         save_projects(projects)

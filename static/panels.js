@@ -3021,10 +3021,17 @@ function _retryPreferencesAutosave(){
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
-    // Populate the version badge from the server — keeps it in sync with git
+    // Populate the version badges from the server — keeps them in sync with git
     // tags automatically without any manual release step.
-    const vbadge=document.querySelector('.settings-version-badge');
-    if(vbadge && settings.webui_version) vbadge.textContent=settings.webui_version;
+    const webuiBadge = $('settings-webui-version-badge');
+    if(webuiBadge){
+      webuiBadge.textContent = `WebUI: ${settings.webui_version || 'not detected'}`;
+    }
+    const agentBadge = $('settings-agent-version-badge');
+    if(agentBadge){
+      const agentVersion = (settings.agent_version || 'not detected').toString().trim() || 'not detected';
+      agentBadge.textContent = `Agent: ${agentVersion}`;
+    }
     // Hydrate appearance controls first so a slow /api/models request
     // cannot overwrite an in-progress theme/skin selection.
     const themeSel=$('settingsTheme');

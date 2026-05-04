@@ -1028,6 +1028,7 @@ let _allProjects = [];  // cached project list
 const NO_PROJECT_FILTER = '__none__';
 let _activeProject = null;  // project_id filter (null = show all, NO_PROJECT_FILTER = unassigned only)
 let _showAllProfiles = false;  // false = filter to active profile only
+let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
@@ -1361,10 +1362,15 @@ window.addEventListener('resize',()=>{
 async function renderSessionList(){
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
+    const allProfilesQS = _showAllProfiles ? '?all_profiles=1' : '';
     const [sessData, projData] = await Promise.all([
-      api('/api/sessions'),
-      api('/api/projects'),
+      api('/api/sessions' + allProfilesQS),
+      api('/api/projects' + allProfilesQS),
     ]);
+    // Server's other_profile_count tells us how many sessions exist outside the
+    // active profile so the "Show N from other profiles" toggle can render
+    // without a second round-trip. Stashed on the module for renderSessionListFromCache.
+    _otherProfileCount = sessData.other_profile_count || 0;
     _allSessions = sessData.sessions||[];
     _allProjects = projData.projects||[];
     // Capture server clock for clock-skew compensation (issue #1144).
@@ -1862,10 +1868,14 @@ function renderSessionListFromCache(){
     (activeSidForSidebar&&s.session_id===activeSidForSidebar) ||
     (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0)
   );
-  // Filter by active profile (unless "All profiles" is toggled on)
-  // Server backfills profile='default' for legacy sessions, so every session has a profile.
-  // Show only sessions tagged to the active profile; 'All profiles' toggle overrides.
-  const profileFiltered=_showAllProfiles?withMessages:withMessages.filter(s=>s.is_cli_session||s.profile===S.activeProfile);
+  // The server is authoritative for profile scoping (#1611): it filters by
+  // active profile when no query param is set, and returns the aggregate when
+  // we send ?all_profiles=1. The renamed-root cross-alias (a row tagged
+  // 'default' matching active 'kinni' when kinni.is_default) lives server-side
+  // in _profiles_match, and a strict-equality client filter would reject those
+  // rows incorrectly. So we trust the wire data and skip the redundant client
+  // filter entirely.
+  const profileFiltered=withMessages;
   // Filter by active project. NO_PROJECT_FILTER sentinel asks for sessions
   // with no project_id; otherwise filter to the matching project_id, or
   // pass through when no filter is active.
@@ -1952,19 +1962,23 @@ function renderSessionListFromCache(){
     bar.appendChild(addBtn);
     list.appendChild(bar);
   }
-  // Profile filter toggle (show sessions from other profiles)
-  const otherProfileCount=withMessages.filter(s=>s.profile&&s.profile!==S.activeProfile).length;
+  // Profile filter toggle (show sessions from other profiles).
+  // Cross-profile rows live SERVER-SIDE behind ?all_profiles=1, so the toggle
+  // must trigger a refetch — there's no client-cached aggregate to slice through.
+  // The server is authoritative for the count (renamed-root cross-alias is
+  // server-side). A naive strict-equality client fallback would mis-count.
+  const otherProfileCount = _otherProfileCount;
   if(otherProfileCount>0&&!_showAllProfiles){
     const pfToggle=document.createElement('div');
     pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
     pfToggle.textContent='Show '+otherProfileCount+' from other profiles';
-    pfToggle.onclick=()=>{_showAllProfiles=true;renderSessionListFromCache();};
+    pfToggle.onclick=()=>{_showAllProfiles=true;renderSessionList();};
     list.appendChild(pfToggle);
-  } else if(_showAllProfiles&&otherProfileCount>0){
+  } else if(_showAllProfiles){
     const pfToggle=document.createElement('div');
     pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
     pfToggle.textContent='Show active profile only';
-    pfToggle.onclick=()=>{_showAllProfiles=false;renderSessionListFromCache();};
+    pfToggle.onclick=()=>{_showAllProfiles=false;renderSessionList();};
     list.appendChild(pfToggle);
   }
   // Show/hide archived toggle if there are archived sessions
