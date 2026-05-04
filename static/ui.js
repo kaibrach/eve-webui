@@ -9,10 +9,10 @@ const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
 // single-threaded so only one done event fires at a time in practice.
 let _queueDrainSid=null;
 const $=id=>document.getElementById(id);
-// Redirect to /login when the server responds with 401 (auth session expired).
-// Handles iOS PWA standalone mode where a server-side 302→/login would break
-// out of the PWA shell into Safari instead of navigating within it.
-function _redirectIfUnauth(res){if(res&&res.status===401){window.location.href='/login?next='+encodeURIComponent(window.location.pathname+window.location.search);return true;}return false;}
+// Redirect to login when the server responds with 401 (auth session expired).
+// Handles iOS PWA standalone mode and keeps subpath mounts like /hermes/ from
+// escaping to the personal site root /login.
+function _redirectIfUnauth(res){if(res&&res.status===401){window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);return true;}return false;}
 function _getSessionQueue(sid, create=false){
   if(!sid) return [];
   if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
@@ -2844,10 +2844,17 @@ async function refreshSession() {
   } catch(e) { setStatus('Refresh failed: ' + e.message); }
 }
 // ── Update banner ──
+function _formatUpdateTargetStatus(label,info){
+  if(!info||!(info.behind>0)) return null;
+  const branch=info.branch?` (${info.branch})`:'';
+  return `${label}${branch}: ${info.behind} update${info.behind>1?'s':''}`;
+}
 function _showUpdateBanner(data){
   const parts=[];
-  if(data.webui&&data.webui.behind>0) parts.push(`WebUI: ${data.webui.behind} update${data.webui.behind>1?'s':''}`);
-  if(data.agent&&data.agent.behind>0) parts.push(`Agent: ${data.agent.behind} update${data.agent.behind>1?'s':''}`);
+  const webuiPart=_formatUpdateTargetStatus('WebUI',data.webui);
+  const agentPart=_formatUpdateTargetStatus('Agent',data.agent);
+  if(webuiPart) parts.push(webuiPart);
+  if(agentPart) parts.push(agentPart);
   if(!parts.length)return;
   const msg=$('updateMsg');
   if(msg) msg.textContent='\u2B06 '+parts.join(', ')+' available';
@@ -2976,7 +2983,7 @@ async function _waitForServerThenReload(opts){
   await new Promise(r=>setTimeout(r, interval));
   while(Date.now()<deadline){
     try{
-      const r=await fetch('/health',{cache:'no-store'});
+      const r=await fetch(new URL('health', document.baseURI||location.href).href,{cache:'no-store'});
       if(r.ok){
         let data={};
         try{ data=await r.json(); }catch(_){}

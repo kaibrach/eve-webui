@@ -1,5 +1,55 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.292] — 2026-05-04
+
+### Fixed (12 PRs — multi-tab SSE + subpath routes + cross-source lineage + paste UX + 3 follow-ups)
+
+- **Multi-tab SSE no longer splits stream tokens between tabs** (#1598 by @Michaelyklam, closes #1584) — `api/config.py` introduces a `StreamChannel` broadcast class to replace the single-consumer `queue.Queue` previously stored in `STREAMS[stream_id]`. With the old design, the same session in two tabs was racing to consume tokens from one queue, so one tab might receive `H` while the other received `allo`. The new channel buffers events while no subscriber is connected (so the first tab sees the stream tail that arrived during the gap), and once one or more tabs are subscribed it broadcasts every event to all of them. `_handle_sse_stream()` calls `subscribe()` on connect and `unsubscribe()` in a `finally` block on disconnect/error. Per-stream wiring updated at all three producer callsites (`_handle_chat_start`, `_handle_btw`, `_handle_background`). Per Opus advisor on stage-292: replay-while-subscribing now happens inside the lock to prevent an event-ordering inversion when a 2nd tab subscribes mid-stream.
+
+- **Frontend routes now work under subpath mounts like `/hermes/`** (#1601 by @Michaelyklam) — auth redirect Location header (`api/auth.py`), 401-redirect helpers (`static/ui.js`, `static/workspace.js`), direct fetch/EventSource URLs (`static/{boot,messages,sessions}.js`), and the SMD vendor module import (`static/index.html`) all switched from root-absolute (`/login`, `/api/...`, `/static/...`) to mount-relative (`login`, `api/...`, `static/...`). Where appropriate, the mount-relative URL is anchored against `document.baseURI || location.href` so the `<base href>` element correctly resolves it under deep SPA routes. Per Opus advisor on stage-292: the gateway SSE probe in `static/sessions.js:1440` now also uses `document.baseURI || location.href` for parity with the other 5 callsites in this PR, ensuring it doesn't 404 under subpath at deep routes. Self-hosters running WebUI behind a reverse proxy or container ingress at a path prefix can now have everything work without Caddy/nginx rewrite workarounds.
+
+- **Streaming markdown now formats live segments under subpath mounts** (#1600 by @Michaelyklam) — `static/index.html` SMD module import switched to mount-relative form. `static/messages.js` fallback path (when `window.smd` isn't loaded) now passes the visible segment through `renderMd(fallbackText)` for the FIRST live segment as well as post-tool segments — previously the first segment was inserted as raw `parsed.displayText`, leaving markdown visible until the assistant's turn completed.
+
+- **Cross-source session continuations stay separate in the sidebar** (#1602 by @ai-ag2026) — `api/agent_sessions.py:_is_continuation_session()` now refuses to collapse parent/child where `parent.source != child.source`. A WebUI session continuing from a Telegram/CLI compression-chained parent stays visible as its own WebUI row instead of inheriting the old parent's title and source metadata. Non-continuation child rows now also expose `parent_title` + `parent_source` so the surface can show the lineage without losing the child's own identity.
+
+- **Paste no longer drops text when clipboard has both text and image** (#1622 by @s905060, closes #1620) — `static/boot.js` paste handler used to intercept on any `image/*` clipboard item, calling `preventDefault()` and attaching the image as a screenshot. Pasting from rich-text sources (Notes, Word, Slack, browser selections) attaches a rendered preview alongside the plain text — so the handler swallowed the text payload and only the rogue image was attached. Now defers to the browser's default text-paste when the clipboard also carries `text/plain` or `text/html` string items, and only intercepts when the clipboard is image-only (true screenshot paste). Image filter also tightened to `kind === 'file'` so string items advertising an image MIME (e.g. `text/html` with embedded data URIs) aren't misclassified.
+
+- **Forked session sidebar indicator is now recognizable and less noisy** (#1621 by @franksong2702, fixes #1613) — replaced the permanent `⑂` OCR glyph with the existing `git-branch` SVG icon, made the indicator subtle (.35 opacity) until row hover/focus/active states (.85 opacity), changed the tooltip to prefer the parent session title with a truncated-id fallback, and removed the hidden click-to-parent behavior from the sidebar row (was unpredictable). The `/branch` command and fork data model are unchanged.
+
+- **Update banner now shows tracked branches in labels** (#1605 by @ai-ag2026) — `static/ui.js` and `static/panels.js` use a new `_formatUpdateTargetStatus(label, info)` formatter that includes `info.branch` parenthetical, so `WebUI (origin/master): 0 updates, Agent (origin/main): 32 updates` is displayed in mixed states instead of the generic `Agent: 32 updates` that could be misread as the WebUI being behind. Settings panel uses a typeof-guarded fallback to a local formatter for back-compat with older boot states.
+
+- **Update compare URLs preserve git remote names ending in g/i/t** (#1603 by @ai-ag2026) — `api/updates.py` was using `str.rstrip('.git')` for the remote URL trim, which is a CHARACTER-CLASS strip — `'hermes-webui.git'` became `'hermes-webu'` (it strips trailing `g`, then `i`, then `.`, then more `i`'s, then `u`...). The updated logic checks `endswith('.git')` and slices the literal suffix, leaving `hermes-webui`/`hermes-agent` and any other remote name intact. Both HTTPS and SSH origin forms covered.
+
+- **`_pending_started_at` truthy-check fallback** (#1599 by @Sanjays2402, closes #1595) — `api/streaming.py:2058` tightens the per-turn duration fallback from `is not None` to a truthy check so `None`, missing-attr, and an explicit `0` all uniformly fall back to `time.time()`. Closes the loop on the v0.50.290 retro lesson — the v0.50.290 contributor's source-string assertion that pinned the old `is not None` form is removed by this PR. Behavioral assertions on the duration fallback remain.
+
+- **pytest config-path isolation** (#1597 by @Michaelyklam) — Hermes Agent sessions can set `HERMES_CONFIG_PATH` to the real `~/.hermes/config.yaml` before invoking pytest, so onboarding/provider tests could read/write the developer's live config. `tests/conftest.py` now overrides `HERMES_CONFIG_PATH` to point at the isolated test home before any product modules are imported. `api/providers.py:_clean_provider_key_from_config()` switches from import-time-bound `_get_config_path` to call-time resolution through `api.config._get_config_path()` so monkeypatches and tests work correctly.
+
+- **Cron worker no longer silently ignores profile-context failures** (#1608 by @franksong2702, closes #1578) — `_run_cron_tracked()` no longer wraps `cron_profile_context_for_home(profile_home).__enter__()` in a `try/except Exception` that silently sets `ctx = None`. A silent fallback in the worker thread leaves the job running unpinned against process-global `HERMES_HOME`, silently corrupting cross-profile state — same class of bug as #1573. Lets the exception propagate (kill the worker thread) rather than corrupt cross-profile state. Source-level regression test catches any future re-introduction of the over-broad except clause.
+
+- **TCP keepalive cleanup + macOS support** (#1609 by @franksong2702, closes #1583) — `server.py` cleanup follow-up to v0.50.289. Deletes the dead `QuietHTTPServer.server_bind()` override (TCP_KEEP* setsockopts on the listening socket are no-ops without SO_KEEPALIVE, which can't be set on a passive socket anyway). Splits `Handler.setup()` into proper ordering — TCP_NODELAY first, then SO_KEEPALIVE, then per-platform timing parameters: Linux uses `TCP_KEEPIDLE/INTVL/CNT`, macOS uses `TCP_KEEPALIVE`. Previously, on macOS, the entire try block aborted on the first `AttributeError` from `TCP_KEEPIDLE` and SO_KEEPALIVE was never applied — connections never had keepalive at all on Mac.
+
+### Tests
+
+4117 → **4142 passing** (+25 new regression tests across all 12 PRs). 0 regressions. Full suite in ~125s.
+
+### Pre-release verification
+
+- **Opus advisor**: SHIP verdict. Two SHOULD-FIX items absorbed in-release per <20-LOC defensive policy: (1) #1598 ordering race fixed by moving offline-buffer replay inside the subscribe lock; (2) #1601 sessions.js:1440 gateway SSE probe switched to `document.baseURI || location.href` for parity with PR's other 5 callsites.
+- **JS syntax**: all 6 modified .js files checked clean with `node -c`.
+- **Browser API sanity**: 11/11 endpoints OK on stage server.
+- **CHANGELOG / ROADMAP / TESTING**: stamps updated for v0.50.292 / 4142 baseline.
+
+### Authors
+
+- @Michaelyklam — 4 PRs (#1597, #1598, #1600, #1601)
+- @ai-ag2026 — 3 PRs (#1602, #1603, #1605)
+- @franksong2702 — 3 PRs (#1608, #1609, #1621)
+- @Sanjays2402 — 1 PR (#1599)
+- @s905060 — 1 PR (#1622)
+
+Closes #1578, #1583, #1584, #1595, #1613, #1620.
+
+
 ## [v0.50.291] — 2026-05-04
 
 ### Fixed (1 PR — "What's new?" link 404 — closes #1579)

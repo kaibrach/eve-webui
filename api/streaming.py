@@ -2054,8 +2054,10 @@ def _run_agent_streaming(
                 agent.ephemeral_system_prompt = _personality_prompt
             _pending_started_at = getattr(s, 'pending_started_at', None)
             # Normal chat-start sets pending_started_at before spawning this thread;
-            # fallback to now only for recovered/legacy flows where that marker is absent.
-            _turn_started_at = _pending_started_at if _pending_started_at is not None else time.time()
+            # fallback to now only for recovered/legacy flows where that marker is absent
+            # or has been zeroed out (e.g. via a buggy migration / manual file edit).
+            # Truthy-check covers None, missing-attr, and 0 uniformly.
+            _turn_started_at = _pending_started_at if _pending_started_at else time.time()
             _previous_messages = list(s.messages or [])
             _previous_context_messages = list(_session_context_messages(s))
             _pre_compression_count = getattr(

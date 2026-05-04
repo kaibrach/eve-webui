@@ -28,6 +28,58 @@ def read(rel):
 
 # ── api/updates.py ────────────────────────────────────────────────────────────
 
+class TestUpdateChecker:
+    def test_repo_url_strips_only_dot_git_suffix(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[:2] == ['rev-list', '--count']:
+                return '0', True
+            if args[0] == 'merge-base':
+                return 'abcdef1234567890', True
+            if args[:2] == ['rev-parse', '--short']:
+                return 'abcdef1', True
+            if args[:2] == ['remote', 'get-url']:
+                return 'https://github.com/nesquena/hermes-webui.git', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        result = upd._check_repo(tmp_path, 'webui')
+
+        assert result['repo_url'] == 'https://github.com/nesquena/hermes-webui'
+
+    def test_repo_url_converts_ssh_and_strips_only_dot_git_suffix(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/main', True
+            if args[:2] == ['rev-list', '--count']:
+                return '0', True
+            if args[0] == 'merge-base':
+                return 'abcdef1234567890', True
+            if args[:2] == ['rev-parse', '--short']:
+                return 'abcdef1', True
+            if args[:2] == ['remote', 'get-url']:
+                return 'git@github.com:NousResearch/hermes-agent.git', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        result = upd._check_repo(tmp_path, 'agent')
+
+        assert result['repo_url'] == 'https://github.com/NousResearch/hermes-agent'
+
+
 class TestConflictError:
     """#813 — conflict error must include flag + recovery command."""
 
@@ -349,13 +401,14 @@ class TestUiJsUpdateBanner:
         )
 
     def test_wait_for_server_polls_health(self):
-        """_waitForServerThenReload() must fetch /health to determine readiness."""
+        """_waitForServerThenReload() must fetch health to determine readiness."""
         src = read('static/ui.js')
         m = re.search(r'function\s+_waitForServerThenReload\b.*?\n\}', src, re.DOTALL)
         assert m, "_waitForServerThenReload() not found"
         fn = m.group(0)
-        assert '/health' in fn, (
-            "_waitForServerThenReload must poll /health to detect server readiness"
+        assert "new URL('health'" in fn, (
+            "_waitForServerThenReload must poll the mount-relative health endpoint "
+            "to detect server readiness"
         )
         assert 'location.reload' in fn, (
             "_waitForServerThenReload must call location.reload() once the server is ready"
@@ -394,6 +447,24 @@ class TestUiJsUpdateBanner:
         assert 'updateError' in fn, (
             "_showUpdateError must write to the #updateError element for persistent display"
         )
+
+
+class TestUpdateBannerUx:
+    def test_update_banner_includes_repo_branch_labels(self):
+        src = read('static/ui.js')
+        assert 'function _formatUpdateTargetStatus' in src
+        assert 'info.branch' in src
+        assert "_formatUpdateTargetStatus('WebUI',data.webui)" in src
+        assert "_formatUpdateTargetStatus('Agent',data.agent)" in src
+
+    def test_settings_update_check_uses_same_repo_branch_formatter(self):
+        src = read('static/panels.js')
+        m = re.search(r'async function checkUpdatesNow\b.*?\n\}', src, re.DOTALL)
+        assert m, "checkUpdatesNow() not found"
+        fn = m.group(0)
+        assert '_formatUpdateTargetStatus' in fn
+        assert "formatUpdatePart('WebUI',data.webui)" in fn
+        assert "formatUpdatePart('Agent',data.agent)" in fn
 
 
 # ── static/index.html ─────────────────────────────────────────────────────────

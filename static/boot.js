@@ -965,8 +965,15 @@ document.addEventListener('keydown',async e=>{
 });
 $('msg').addEventListener('paste',e=>{
   const items=Array.from(e.clipboardData?.items||[]);
-  const imageItems=items.filter(i=>i.type.startsWith('image/'));
-  if(!imageItems.length)return;
+  // When the clipboard carries BOTH text and an image (common from Notes,
+  // Word, browsers, Slack — the OS attaches a rendered preview alongside
+  // the plain text), prefer the text and let the browser paste normally.
+  // Only intercept when the clipboard is image-only (true screenshot paste).
+  // Tighten the image filter to kind==='file' so string items advertising an
+  // image MIME (e.g. text/html with an embedded data URI) are not misclassified.
+  const hasText=items.some(i=>i.kind==='string'&&(i.type==='text/plain'||i.type==='text/html'));
+  const imageItems=items.filter(i=>i.kind==='file'&&i.type.startsWith('image/'));
+  if(!imageItems.length||hasText)return;
   e.preventDefault();
   const files=imageItems.map(i=>{
     const blob=i.getAsFile();
@@ -1287,7 +1294,7 @@ function applyBotName(){
   // ?test_updates=1 in URL forces banner display for testing (bypasses sessionStorage guards)
   const _testUpdates=new URLSearchParams(location.search).get('test_updates')==='1';
   if(_testUpdates||(_bootSettings.check_for_updates!==false&&!sessionStorage.getItem('hermes-update-checked')&&!sessionStorage.getItem('hermes-update-dismissed'))){
-    const _checkUrl='/api/updates/check'+(_testUpdates?'?simulate=1':'');
+    const _checkUrl='api/updates/check'+(_testUpdates?'?simulate=1':'');
     api(_checkUrl).then(d=>{if(!_testUpdates)sessionStorage.setItem('hermes-update-checked','1');if((d.webui&&d.webui.behind>0)||(d.agent&&d.agent.behind>0))_showUpdateBanner(d);}).catch(()=>{});
   }
   // Fetch active profile

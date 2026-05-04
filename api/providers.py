@@ -593,7 +593,13 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
     from api.config import _cfg_lock
 
     try:
-        config_path = _get_config_path()
+        # Resolve through api.config at call time instead of the function imported
+        # at module load. Several tests (and some profile flows) monkeypatch the
+        # config module's path resolver after api.providers has already been
+        # imported; using the stale imported reference can clean the wrong
+        # config.yaml.
+        import api.config as _config
+        config_path = _config._get_config_path()
     except Exception:
         return
 
