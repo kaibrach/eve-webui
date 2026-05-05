@@ -2,7 +2,7 @@
 
 > Web companion to the Hermes Agent CLI. Same workflows, browser-native.
 >
-> Last updated: v0.50.297 (May 04, 2026) — 4288 tests collected
+> Last updated: v0.51.0 (May 04, 2026) — 4356 tests collected — Kanban v1 launch
 > Test source: `pytest tests/ --collect-only -q`
 > Per-version detail: see [CHANGELOG.md](./CHANGELOG.md)
 

