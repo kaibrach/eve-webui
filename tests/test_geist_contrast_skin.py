@@ -7,6 +7,7 @@ CSS = (REPO / "static" / "style.css").read_text(encoding="utf-8")
 BOOT_JS = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
 CONFIG_PY = (REPO / "api" / "config.py").read_text(encoding="utf-8")
 INDEX_HTML = (REPO / "static" / "index.html").read_text(encoding="utf-8")
+COMMANDS_JS = (REPO / "static" / "commands.js").read_text(encoding="utf-8")
 
 
 def test_geist_contrast_skin_is_registered_with_matching_key_and_label():
@@ -15,6 +16,12 @@ def test_geist_contrast_skin_is_registered_with_matching_key_and_label():
     assert "s.value||s.name" in BOOT_JS
     assert "'geist-contrast':1" in INDEX_HTML
     assert '"geist-contrast"' in CONFIG_PY
+
+
+def test_geist_contrast_slash_theme_uses_skin_value_key():
+    assert "const skins=(_SKINS||[]).map(s=>(s.value||s.name).toLowerCase());" in COMMANDS_JS
+    assert "skins.includes(val)" in COMMANDS_JS
+    assert "showToast(t('theme_set')+appearance.skin)" in COMMANDS_JS
 
 
 def test_geist_contrast_dark_tokens_use_yellow_accent_with_neutral_surfaces():
