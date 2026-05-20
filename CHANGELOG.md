@@ -4,6 +4,12 @@
 ## [Unreleased]
 
 
+## [v0.51.98] — 2026-05-20 — Release BV (stage-391 — 1-PR follow-on — custom_providers allowlist priority over live /v1/models)
+
+### Fixed
+
+- **PR #2640** by @colin-chang — When a `custom_providers` entry in `config.yaml` declares a curated `models:` allowlist (e.g. a ZenMux or other aggregator gateway), respect the curated list instead of also fetching the live `/v1/models` catalog. Without this guard the picker rendered hundreds of online models alongside the user's curated three, swamping the intended selection. The allowlist guard skips the live probe entirely; the existing fall-through to a live probe still runs when no `models:` list is configured. Composes cleanly with #2626 / v0.51.96 — when the live probe is skipped, no `models_endpoint_error` is surfaced (the curated list is the source of truth and probe failures should not show as a user-facing diagnostic in that case).
+
 ## [v0.51.97] — 2026-05-20 — Release BU (stage-390 — 2-PR batch — startup session-index rebuild + config-managed custom-provider cards)
 
 ### Fixed
