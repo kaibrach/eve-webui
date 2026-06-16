@@ -1529,6 +1529,17 @@ def test_runtime_inplace_expand_then_search_clear_preserves_expanded_group(_driv
     """
     payload = {
         "groups": [
+            # A second group is selected so the openrouter group is NOT the
+            # selected group and can only remain expanded via the hiddenByDefault/
+            # _prevHasSearch machinery being tested — not via _selectedGroupKey.
+            {
+                "provider": "Anthropic",
+                "provider_id": "anthropic",
+                "models": [
+                    {"id": "anthropic/claude", "label": "Claude"},
+                ],
+                "extra_models": [],
+            },
             {
                 "provider": "OpenRouter",
                 "provider_id": "openrouter",
@@ -1540,8 +1551,9 @@ def test_runtime_inplace_expand_then_search_clear_preserves_expanded_group(_driv
                     {"id": "openrouter/overflow-one", "label": "Overflow One"},
                     {"id": "openrouter/overflow-two", "label": "Overflow Two"},
                 ],
-            }
+            },
         ],
+        "selectedValue": "anthropic/claude",
         "searchTerm": "overflow",
     }
     result = subprocess.run(
