@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.508] — 2026-06-19 — Release RS (the /model command works under a reverse-proxy subpath)
+
+### Fixed
+
+- **The `/model` slash command now works when the WebUI is served under a subpath (#3368 follow-up).** Its two API calls (`/api/models` and `/api/session/update`) used root-absolute paths that broke behind a reverse proxy mounting the app under a subpath; they now resolve relative to `document.baseURI`, matching how the rest of the app builds API URLs. Thanks @tomtong2015.
+
 ## [v0.51.507] — 2026-06-19 — Release RR (jump-to-question button stays usable on mobile)
 
 ### Fixed
