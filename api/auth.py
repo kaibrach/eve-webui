@@ -664,9 +664,9 @@ def get_session_username(cookie_value: str) -> str | None:
     token = cookie_value.rsplit('.', 1)[0]
     with _SESSIONS_LOCK:
         session = _sessions.get(token)
-        if session:
+        if isinstance(session, dict):
             return session.get("username") or ""
-    return None
+        return ""  # legacy float session — no username
 
 
 def parse_cookie(handler) -> str | None:
