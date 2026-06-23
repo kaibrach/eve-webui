@@ -42,8 +42,18 @@ def _load_users() -> dict:
                 _users = data
                 _loaded = True
                 return _users
+            # File exists but isn't a dict — warn so operators notice in
+            # production logs. Fall through to empty users so the server
+            # still starts, but the WARNING-level log makes it impossible
+            # to miss in a multi-user-only deployment that would be
+            # unauthenticated as a result.
+            logger.warning(
+                "users.json exists but is not a dict (got %s). "
+                "Multi-user auth will be unavailable until the file is fixed.",
+                type(data).__name__,
+            )
     except Exception as e:
-        logger.debug("Failed to load users file: %s", e)
+        logger.warning("Failed to load users.json: %s", e)
     _users = {}
     _loaded = True
     return _users
