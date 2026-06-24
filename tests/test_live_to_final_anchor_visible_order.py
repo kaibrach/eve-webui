@@ -427,6 +427,20 @@ def test_live_anchor_scene_removes_legacy_interim_collapse_toggle():
     assert guard_idx < remove_idx < legacy_create_idx
 
 
+def test_recycled_assistant_turn_clears_live_anchor_attrs_before_role_refresh():
+    reset_attrs = UI_JS[UI_JS.index("const _recycleResetAttrs="):UI_JS.index("let _scrollbarDragActive=false;")]
+    assert "data-anchor-scene-live-owner" in reset_attrs
+    assert "data-anchor-stream-id" in reset_attrs
+    assert "data-live-assistant-turn" in reset_attrs
+
+    recycle = _function_body(UI_JS, "renderMessages")
+    recycle = recycle[recycle.index("if(!currentAssistantTurn){"):]
+
+    loop_idx = recycle.index("for(const attr of _recycleResetAttrs) recycled.removeAttribute(attr);")
+    refresh_idx = recycle.index("if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');")
+    assert loop_idx < refresh_idx
+
+
 def test_tool_scene_rows_coalesce_by_logical_tool_call_identity():
     rows = _function_body(UI_JS, "_anchorSceneRowsForRendering")
     key = _function_body(UI_JS, "_anchorSceneToolRowLogicalKey")

@@ -438,6 +438,14 @@ let _messageVirtualScrollSettleTimer=0;
 let _messageVirtualDeferredMeasurement=null;
 let _msgNodeRecycleEnabled=false;
 const _recycleStash=new Map();
+const _recycleResetAttrs=[
+  'data-transparent-turn-collapsed',
+  'data-transparent-turn-toggle-bound',
+  'data-anchor-scene-live-owner',
+  'data-anchor-stream-id',
+  // Defensive reset for legacy/restored shells that may still carry the fallback live-turn marker.
+  'data-live-assistant-turn',
+];
 let _scrollbarDragActive=false;
 function _markMessageVirtualScrollActive(){
   _messageVirtualScrollActive=true;
@@ -3932,7 +3940,7 @@ if(typeof window!=='undefined'){
   const el=document.getElementById('messages');
   if(!el) return;
   el.addEventListener('pointerdown',(e)=>{
-    if(e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
+    if(e.target===el&&e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
   },{passive:true});
   window.addEventListener('pointerup',()=>{
     if(!_scrollbarDragActive) return;
@@ -11540,8 +11548,7 @@ function renderMessages(options){
       if(recycled){
         const blocks=_assistantTurnBlocks(recycled);
         if(blocks) blocks.innerHTML='';
-        recycled.removeAttribute('data-transparent-turn-collapsed');
-        recycled.removeAttribute('data-transparent-turn-toggle-bound');
+        for(const attr of _recycleResetAttrs) recycled.removeAttribute(attr);
         const role=recycled.querySelector('.msg-role.assistant');
         if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
         currentAssistantTurn=recycled;
