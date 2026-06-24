@@ -11800,7 +11800,14 @@ def handle_post(handler, parsed) -> bool:
                 username = get_session_username(session_cookie) if session_cookie else None
                 if username:  # non-admin user with a username in the session
                     assigned = get_user_profile(username)
-                    if assigned and name != assigned:
+                    if assigned is None:
+                        # User has been deleted — deny all profile switches
+                        return bad(
+                            handler,
+                            f"Access denied: user '{username}' no longer exists",
+                            403,
+                        )
+                    if name != assigned:
                         return bad(
                             handler,
                             f"Access denied: profile '{name}' is not assigned to user '{username}'",
