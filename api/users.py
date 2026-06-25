@@ -76,7 +76,7 @@ def _save_users(users: dict) -> None:
                 pass
             raise
     except Exception as e:
-        logger.debug("Failed to persist users: %s", e)
+        logger.warning("Failed to persist users: %s", e)
 
 
 def _ensure_loaded():
