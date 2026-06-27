@@ -2584,6 +2584,38 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return typeof content==='string'?content:String(content||'');
   }
+  function _anchorSceneContentText(part){
+    if(part===undefined||part===null) return '';
+    if(typeof part==='string') return part;
+    if(typeof part!=='object') return String(part||'');
+    return String(part.text||part.content||part.input_text||part.output_text||part.thinking||part.reasoning||part.summary||'');
+  }
+  function _anchorSceneContentVisibleText(part){
+    if(part===undefined||part===null) return '';
+    if(typeof part==='string') return part;
+    if(typeof part!=='object') return String(part||'');
+    const partType=String(part.type||'');
+    if(partType==='thinking'||partType==='reasoning') return '';
+    const contentText=(partType==='text'||partType==='input_text'||partType==='output_text')?part.content:'';
+    return String(part.text||part.input_text||part.output_text||contentText||'');
+  }
+  function _anchorSceneMessageHasContentToolUse(message){
+    return !!(message&&Array.isArray(message.content)&&message.content.some(part=>part&&typeof part==='object'&&part.type==='tool_use'));
+  }
+  function _anchorSceneFinalAnswerText(message){
+    if(!_anchorSceneMessageHasContentToolUse(message)) return _anchorSceneMessageText(message);
+    const content=Array.isArray(message.content)?message.content:[];
+    let lastToolIndex=-1;
+    for(let i=0;i<content.length;i+=1){
+      const part=content[i];
+      if(part&&typeof part==='object'&&part.type==='tool_use') lastToolIndex=i;
+    }
+    const tailText=content.slice(lastToolIndex+1)
+      .map(part=>_anchorSceneContentVisibleText(part))
+      .filter(text=>_anchorSceneCleanText(text))
+      .join('\n');
+    return _anchorSceneCleanText(tailText)?tailText:'';
+  }
   function _anchorSceneCleanText(value){
     return String(value||'').replace(/\s+/g,' ').trim();
   }
@@ -2618,6 +2650,31 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){}
     }
     return {};
+  }
+  function _anchorSceneContentTool(part){
+    if(!part||typeof part!=='object') return {};
+    const fn=part.function&&typeof part.function==='object'?part.function:{};
+    return {
+      id:part.id||part.tid||part.tool_call_id||part.tool_use_id||part.call_id,
+      tid:part.tid||part.id||part.tool_call_id||part.tool_use_id||part.call_id,
+      tool_call_id:part.tool_call_id,
+      tool_use_id:part.tool_use_id,
+      call_id:part.call_id,
+      name:part.name||part.tool_name||fn.name||'tool',
+      tool_name:part.tool_name,
+      args:part.args,
+      input:part.input,
+      function:part.function,
+      command:part.command||part.raw_command||part.original_command||part.display_command,
+      preview:part.preview||part.summary,
+      snippet:part.snippet||part.result||part.output,
+      result:part.result,
+      output:part.output,
+      is_error:part.is_error,
+      error:part.error,
+      duration:part.duration,
+      started_at:part.started_at,
+    };
   }
   function _anchorSceneStringPayload(value){
     if(value===undefined||value===null) return '';
@@ -2721,9 +2778,207 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     };
     return row;
   }
+  function _anchorSceneToolRowName(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    return String(tool.name||payload.name||'tool').trim().toLowerCase();
+  }
+  function _anchorSceneToolRowId(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    return String(
+      (row&&row.tool_call_id)||
+      tool.id||
+      tool.tid||
+      tool.tool_call_id||
+      tool.tool_use_id||
+      tool.call_id||
+      payload.tid||
+      payload.id||
+      ''
+    ).trim();
+  }
+  function _anchorSceneToolRowsHaveNonConflictingIds(existing, incoming){
+    const existingId=_anchorSceneToolRowId(existing);
+    const incomingId=_anchorSceneToolRowId(incoming);
+    return !existingId||!incomingId||existingId===incomingId;
+  }
+  function _anchorSceneToolRowsHaveDifferentExplicitIds(existing, incoming){
+    const existingId=_anchorSceneToolRowId(existing);
+    const incomingId=_anchorSceneToolRowId(incoming);
+    return !!existingId&&!!incomingId&&existingId!==incomingId;
+  }
+  function _anchorSceneToolRowStartedAt(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    const value=tool.started_at!==undefined&&tool.started_at!==null&&tool.started_at!==''?tool.started_at:payload.started_at;
+    return value!==undefined&&value!==null&&value!==''?String(value):'';
+  }
+  function _anchorSceneToolRowsHaveSameStartedAt(existing, incoming){
+    const existingStartedAt=_anchorSceneToolRowStartedAt(existing);
+    const incomingStartedAt=_anchorSceneToolRowStartedAt(incoming);
+    return !!existingStartedAt&&!!incomingStartedAt&&existingStartedAt===incomingStartedAt;
+  }
+  function _anchorSceneToolRowBodyText(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    for(const value of [tool.snippet,payload.snippet,tool.output,payload.output,tool.result,payload.result,tool.preview,payload.preview]){
+      const text=_anchorSceneStringPayload(value).trim();
+      if(text) return text;
+    }
+    return '';
+  }
+  function _anchorSceneToolRowsHaveCompatibleBody(existing, incoming){
+    const existingBody=_anchorSceneToolRowBodyText(existing);
+    const incomingBody=_anchorSceneToolRowBodyText(incoming);
+    return !!existingBody&&!!incomingBody&&(
+      existingBody===incomingBody||
+      existingBody.startsWith(incomingBody)||
+      incomingBody.startsWith(existingBody)
+    );
+  }
+  function _anchorSceneToolRowsHaveCompatibleNames(existing, incoming){
+    const existingName=_anchorSceneToolRowName(existing);
+    const incomingName=_anchorSceneToolRowName(incoming);
+    return !existingName||!incomingName||existingName==='tool'||incomingName==='tool'||existingName===incomingName;
+  }
+  function _anchorSceneToolRowArgs(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    const args=(tool.args&&typeof tool.args==='object'&&!Array.isArray(tool.args))?tool.args:payload.args;
+    return args&&typeof args==='object'&&!Array.isArray(args)?args:null;
+  }
+  function _anchorSceneObjectContainsSubset(base, subset){
+    if(!base||!subset||typeof base!=='object'||typeof subset!=='object') return false;
+    const stableStringify=(candidate)=>{
+      const normalize=(value)=>{
+        if(!value||typeof value!=='object') return value;
+        if(Array.isArray(value)) return value.map(normalize);
+        const normalized={};
+        Object.keys(value).sort().forEach((key)=>{normalized[key]=normalize(value[key]);});
+        return normalized;
+      };
+      try{return JSON.stringify(normalize(candidate));}catch(_){return JSON.stringify(candidate);}
+    };
+    for(const [key,value] of Object.entries(subset)){
+      if(!Object.prototype.hasOwnProperty.call(base,key)) return false;
+      if(stableStringify(base[key])!==stableStringify(value)) return false;
+    }
+    return true;
+  }
+  function _anchorSceneToolRowsHaveCompatibleInvocation(existing, incoming){
+    const existingTool=existing&&existing.tool&&typeof existing.tool==='object'?existing.tool:{};
+    const incomingTool=incoming&&incoming.tool&&typeof incoming.tool==='object'?incoming.tool:{};
+    const existingPayload=existing&&existing.payload&&typeof existing.payload==='object'?existing.payload:{};
+    const incomingPayload=incoming&&incoming.payload&&typeof incoming.payload==='object'?incoming.payload:{};
+    const existingCommand=_anchorSceneStringPayload(existingTool.command||existingPayload.command).trim();
+    const incomingCommand=_anchorSceneStringPayload(incomingTool.command||incomingPayload.command).trim();
+    if(existingCommand&&incomingCommand) return existingCommand===incomingCommand;
+    const existingArgs=_anchorSceneToolRowArgs(existing);
+    const incomingArgs=_anchorSceneToolRowArgs(incoming);
+    if(!existingArgs||!incomingArgs||!Object.keys(existingArgs).length||!Object.keys(incomingArgs).length) return false;
+    return _anchorSceneObjectContainsSubset(existingArgs,incomingArgs)||_anchorSceneObjectContainsSubset(incomingArgs,existingArgs);
+  }
+  function _anchorSceneToolRowHasInvocationEvidence(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    const command=_anchorSceneStringPayload(tool.command||payload.command).trim();
+    const args=_anchorSceneToolRowArgs(row);
+    return !!command||!!(args&&Object.keys(args).length);
+  }
+  function _anchorSceneToolRowsCanNameMatch(existing, incoming){
+    if(!_anchorSceneToolRowsHaveCompatibleNames(existing,incoming)) return false;
+    if(_anchorSceneToolRowHasInvocationEvidence(existing)&&_anchorSceneToolRowHasInvocationEvidence(incoming)){
+      return _anchorSceneToolRowsHaveCompatibleInvocation(existing,incoming);
+    }
+    return true;
+  }
+  function _anchorSceneMatchingContentToolRow(contentToolRows, incomingRow, ordinal, usedRows, incomingTotal, idFlexibleRows){
+    if(!Array.isArray(contentToolRows)||!incomingRow) return null;
+    const incomingTid=incomingRow.tool_call_id||(incomingRow.tool&&incomingRow.tool.id);
+    for(const row of contentToolRows){
+      if(!row||usedRows.has(row)) continue;
+      const tid=row.tool_call_id||(row.tool&&row.tool.id);
+      if(tid&&incomingTid&&tid===incomingTid) return row;
+    }
+    if(contentToolRows.length===1&&Number(incomingTotal)===1){
+      const onlyRow=contentToolRows[0];
+      if(onlyRow&&!usedRows.has(onlyRow)&&_anchorSceneToolRowsCanNameMatch(onlyRow,incomingRow)) return onlyRow;
+    }
+    const availableRows=contentToolRows.filter(row=>row&&!usedRows.has(row));
+    if(availableRows.length===1){
+      if(Number(incomingTotal)===1&&_anchorSceneToolRowsCanNameMatch(availableRows[0],incomingRow)) return availableRows[0];
+      if(
+        _anchorSceneToolRowsHaveCompatibleNames(availableRows[0],incomingRow)&&
+        _anchorSceneToolRowsHaveCompatibleInvocation(availableRows[0],incomingRow)
+      ) return availableRows[0];
+    }
+    const reusableRows=contentToolRows.filter(row=>row&&usedRows.has(row));
+    if(
+      reusableRows.length===1&&
+      Number(incomingTotal)===1&&
+      (
+        (
+          _anchorSceneToolRowId(reusableRows[0])&&
+          _anchorSceneToolRowId(incomingRow)&&
+          _anchorSceneToolRowId(reusableRows[0])===_anchorSceneToolRowId(incomingRow)
+        )||
+        (
+          idFlexibleRows&&
+          idFlexibleRows.has(reusableRows[0])&&
+          _anchorSceneToolRowsHaveSameStartedAt(reusableRows[0],incomingRow)&&
+          _anchorSceneToolRowsHaveCompatibleBody(reusableRows[0],incomingRow)
+        )
+      )&&
+      _anchorSceneToolRowsHaveCompatibleNames(reusableRows[0],incomingRow)&&
+      _anchorSceneToolRowsHaveCompatibleInvocation(reusableRows[0],incomingRow)
+    ) return reusableRows[0];
+    for(const row of contentToolRows){
+      if(!row||usedRows.has(row)) continue;
+      const tid=row.tool_call_id||(row.tool&&row.tool.id);
+      if(!tid&&!incomingTid&&_anchorSceneToolRowsCanNameMatch(row,incomingRow)) return row;
+    }
+    return null;
+  }
   function _anchorSceneMessageReasoningText(message){
     if(!message||typeof message!=='object') return '';
     return String(message.reasoning||message._reasoning||message.reasoning_content||message.thinking||'');
+  }
+  function _anchorSceneRowsFromContentParts(message, messageIndex, options){
+    if(!_anchorSceneMessageHasContentToolUse(message)) return null;
+    options=(options&&typeof options==='object')?options:{};
+    const isFinalMessage=!!options.isFinalMessage;
+    const rows=[];
+    const content=Array.isArray(message.content)?message.content:[];
+    let lastToolIndex=-1;
+    for(let i=0;i<content.length;i+=1){
+      const part=content[i];
+      if(part&&typeof part==='object'&&part.type==='tool_use') lastToolIndex=i;
+    }
+    for(let i=0;i<content.length;i+=1){
+      const part=content[i];
+      if(!part||typeof part!=='object'){
+        if(isFinalMessage&&i>lastToolIndex) continue;
+        const text=_anchorSceneContentText(part);
+        if(_anchorSceneCleanText(text)) rows.push(_anchorSceneProseRow(text,rows.length,messageIndex));
+        continue;
+      }
+      if(part.type==='text'||part.type==='input_text'||part.type==='output_text'){
+        if(isFinalMessage&&i>lastToolIndex&&_anchorSceneContentVisibleText(part)) continue;
+        const text=_anchorSceneContentText(part);
+        if(_anchorSceneCleanText(text)) rows.push(_anchorSceneProseRow(text,rows.length,messageIndex));
+        continue;
+      }
+      if(part.type==='thinking'||part.type==='reasoning'){
+        const text=_anchorSceneContentText(part);
+        if(_anchorSceneCleanText(text)) rows.push(_anchorSceneThinkingRow(text,rows.length,messageIndex));
+        continue;
+      }
+      if(part.type==='tool_use'){
+        rows.push(_anchorSceneToolRowFromCall(_anchorSceneContentTool(part),rows.length,messageIndex));
+      }
+    }
+    return rows;
   }
   // #4622: a settled tool row built from messages[].tool_calls (state.db/sidecar)
   // can lack the result body — terminal stdout, or the diff/output that a
@@ -2768,14 +3023,31 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(liveCommand&&_empty(tool.command)&&_empty(payload.command)){
       tool.command=liveCommand; payload.command=liveCommand; enriched=true;
     }
-    const liveArgs=(live.args&&typeof live.args==='object')?live.args:null;
-    const argsEmpty=o=>!o||typeof o!=='object'||Object.keys(o).length===0;
-    if(liveArgs&&argsEmpty(tool.args)&&argsEmpty(payload.args)){
-      tool.args={...liveArgs}; payload.args={...liveArgs}; enriched=true;
+    if(!_empty(live.started_at)&&_empty(tool.started_at)&&_empty(payload.started_at)){
+      tool.started_at=live.started_at; payload.started_at=live.started_at; enriched=true;
+    }
+    const liveArgs=_anchorSceneToolArgs(live);
+    if(liveArgs&&typeof liveArgs==='object'&&Object.keys(liveArgs).length){
+      const mergeMissingArgs=(existing)=>{
+        const base=(existing&&typeof existing==='object'&&!Array.isArray(existing))?{...existing}:{};
+        let changed=!(existing&&typeof existing==='object'&&!Array.isArray(existing));
+        for(const [key,value] of Object.entries(liveArgs)){
+          if(!Object.prototype.hasOwnProperty.call(base,key)){
+            base[key]=value;
+            changed=true;
+          }
+        }
+        return changed?base:existing;
+      };
+      const nextToolArgs=mergeMissingArgs(tool.args);
+      const nextPayloadArgs=mergeMissingArgs(payload.args);
+      if(nextToolArgs!==tool.args){ tool.args=nextToolArgs; enriched=true; }
+      if(nextPayloadArgs!==payload.args){ payload.args=nextPayloadArgs; enriched=true; }
     }
     return enriched;
   }
-  function _anchorSceneRowsByMessageIndex(messages, turnStart, lastAsstIndex){
+  function _anchorSceneRowsByMessageIndex(messages, turnStart, lastAsstIndex, options){
+    options=(options&&typeof options==='object')?options:{};
     const byIdx=new Map();
     const add=(idx,row)=>{
       if(!byIdx.has(idx)) byIdx.set(idx,[]);
@@ -2791,12 +3063,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
     }
     let encounter=0;
-    for(let idx=turnStart+1;idx<lastAsstIndex;idx+=1){
+    const endIndex=options&&options.includeFinal?lastAsstIndex+1:lastAsstIndex;
+    for(let idx=turnStart+1;idx<endIndex;idx+=1){
       const message=messages[idx];
       if(!message||message.role!=='assistant') continue;
       const pool=[];
       const text=_anchorSceneMessageText(message);
-      if(_anchorSceneCleanText(text)){
+      const contentRows=_anchorSceneRowsFromContentParts(message,idx,{isFinalMessage:idx===lastAsstIndex});
+      const hasOrderedContentRows=Array.isArray(contentRows)&&contentRows.length>0;
+      const contentToolRows=[];
+      const usedContentToolRows=new Set();
+      const idFlexibleContentToolRows=new Set();
+      const seenToolIds=new Set();
+      const rowByToolId=new Map();
+      if(hasOrderedContentRows){
+        for(const row of contentRows){
+          pool.push({...row,_phase:1,_encounter:encounter++,_fromContent:true});
+          const tid=row.tool_call_id||(row.tool&&row.tool.id);
+          if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
+          if(row.role==='tool') contentToolRows.push(row);
+        }
+      }else if(_anchorSceneCleanText(text)){
         pool.push({..._anchorSceneProseRow(text,0,idx),_phase:2,_encounter:encounter++});
       }
       const reasoning=_anchorSceneMessageReasoningText(message);
@@ -2806,19 +3093,38 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const messageTools=[];
       if(Array.isArray(message.tool_calls)) messageTools.push(...message.tool_calls);
       if(Array.isArray(message._partial_tool_calls)) messageTools.push(...message._partial_tool_calls);
-      const seenToolIds=new Set();
-      const rowByToolId=new Map();
+      let messageToolOrdinal=0;
       for(const tool of messageTools){
         const row=_anchorSceneToolRowFromCall(tool,0,idx);
-        pool.push({...row,_phase:1,_encounter:encounter++});
         const tid=row.tool_call_id||(row.tool&&row.tool.id);
+        if(tid&&seenToolIds.has(tid)){
+          const existing=rowByToolId.get(tid);
+          if(existing){
+            _enrichSettledToolRowBodyFromLive(existing, tool);
+            if(contentToolRows.includes(existing)) usedContentToolRows.add(existing);
+          }
+          messageToolOrdinal+=1;
+          continue;
+        }
+        const contentMatch=_anchorSceneMatchingContentToolRow(contentToolRows,row,messageToolOrdinal,usedContentToolRows,messageTools.length,idFlexibleContentToolRows);
+        if(contentMatch){
+          if(_anchorSceneToolRowsHaveDifferentExplicitIds(contentMatch,row)) idFlexibleContentToolRows.add(contentMatch);
+          _enrichSettledToolRowBodyFromLive(contentMatch, tool);
+          if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,contentMatch); }
+          usedContentToolRows.add(contentMatch);
+          messageToolOrdinal+=1;
+          continue;
+        }
+        pool.push({...row,_phase:1,_encounter:encounter++});
         if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
+        messageToolOrdinal+=1;
       }
       // Merge S.toolCalls for this index, dedup by tool id. When a live call
       // matches a settled row already in the pool, don't just skip it —
       // restore any result body the settled row is missing (#4622): the live
       // S.toolCalls entry carries the full terminal output / patch diff that the
       // persisted state.db row may have dropped to a short preview or nothing.
+      let liveToolOrdinal=0;
       for(const tool of (toolsByIdx.get(idx)||[])){
         if(!tool||typeof tool!=='object') continue;
         const toolIdx=Number(tool.assistant_msg_idx);
@@ -2827,18 +3133,37 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const tid=row.tool_call_id||(row.tool&&row.tool.id);
         if(tid&&seenToolIds.has(tid)){
           const existing=rowByToolId.get(tid);
-          if(existing) _enrichSettledToolRowBodyFromLive(existing, tool);
+          if(existing){
+            _enrichSettledToolRowBodyFromLive(existing, tool);
+            if(contentToolRows.includes(existing)) usedContentToolRows.add(existing);
+          }
+          liveToolOrdinal+=1;
+          continue;
+        }
+        const liveTools=toolsByIdx.get(idx)||[];
+        const contentMatch=_anchorSceneMatchingContentToolRow(contentToolRows,row,liveToolOrdinal,usedContentToolRows,liveTools.length,idFlexibleContentToolRows);
+        if(contentMatch){
+          if(_anchorSceneToolRowsHaveDifferentExplicitIds(contentMatch,row)) idFlexibleContentToolRows.add(contentMatch);
+          _enrichSettledToolRowBodyFromLive(contentMatch, tool);
+          if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,contentMatch); }
+          usedContentToolRows.add(contentMatch);
+          liveToolOrdinal+=1;
           continue;
         }
         if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
         pool.push({...row,_phase:1,_encounter:encounter++});
+        liveToolOrdinal+=1;
       }
-      // Stable sort by (phase, started_at, encounter)
+      // Stable sort by (phase, started_at, encounter). Once a message has an
+      // ordered content[] scene, preserve that content bucket order exactly.
+      const useStartedAt=!hasOrderedContentRows;
       pool.sort((a,b)=>{
         if(a._phase!==b._phase) return a._phase-b._phase;
-        const aTime=(a.tool&&a.tool.started_at!=null)?a.tool.started_at:Infinity;
-        const bTime=(b.tool&&b.tool.started_at!=null)?b.tool.started_at:Infinity;
-        if(aTime!==bTime) return aTime-bTime;
+        if(useStartedAt){
+          const aTime=(a.tool&&a.tool.started_at!=null)?a.tool.started_at:Infinity;
+          const bTime=(b.tool&&b.tool.started_at!=null)?b.tool.started_at:Infinity;
+          if(aTime!==bTime) return aTime-bTime;
+        }
         return a._encounter-b._encounter;
       });
       // Emit with sequential order_index values, strip temp props.
@@ -2848,7 +3173,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // (no tool id) at the same message index don't collide on the same row_id
       // and get silently deduped by _completeSettledAnchorSceneForTurn().
       for(const row of pool){
-        const {_phase,_encounter,...clean}=row;
+        const {_phase,_encounter,_fromContent,...clean}=row;
         const oi=byIdx.has(idx)?byIdx.get(idx).length:0;
         clean.order_index=oi;
         clean.seq=oi;
@@ -2956,10 +3281,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         break;
       }
     }
-    const finalAnswer=_anchorSceneMessageText(lastAsst);
-    const finalKey=_anchorSceneTextKey(finalAnswer);
     const base=(projectedScene&&typeof projectedScene==='object')?projectedScene:{};
-    const messageRows=_anchorSceneRowsByMessageIndex(messages,turnStart,lastAsstIndex);
+    const messageFinalAnswer=_anchorSceneFinalAnswerText(lastAsst);
+    const finalAnswer=_anchorSceneCleanText(messageFinalAnswer)
+      ? messageFinalAnswer
+      : (typeof base.final_answer==='string'?base.final_answer:'');
+    const finalKey=_anchorSceneTextKey(finalAnswer);
+    const messageRows=_anchorSceneRowsByMessageIndex(messages,turnStart,lastAsstIndex,{includeFinal:true});
     const hasSettledThinking=_anchorSceneMessageRowsHaveThinking(messageRows);
     const rows=[];
     const seen=new Set();
@@ -2983,7 +3311,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(row&&row.role==='terminal') continue;
       pushRow(row);
     }
-    for(let idx=turnStart+1;idx<lastAsstIndex;idx+=1){
+    for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
       const bucket=messageRows.get(idx)||[];
       for(const row of bucket) pushRow(row);
     }
@@ -3001,7 +3329,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           .map(m=>_anchorSceneMessageRef(m)),
       },
       lifecycle:(base.lifecycle&&typeof base.lifecycle==='object')?{...base.lifecycle}:{},
-      final_answer:_anchorSceneCleanText(finalAnswer)?finalAnswer:(typeof base.final_answer==='string'?base.final_answer:''),
+      final_answer:_anchorSceneCleanText(finalAnswer)?finalAnswer:'',
       final_message_ref:_anchorSceneMessageRef(lastAsst),
       turn_duration:_anchorSceneTurnDurationForSettlement(lastAsst,base),
       terminal_state:base.terminal_state||((base.lifecycle&&base.lifecycle.terminal_state)||null),
