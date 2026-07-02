@@ -466,6 +466,60 @@ function _syncCronScheduleWarning() {
   warning.style.display = _cronScheduleKindForInput(input.value) === 'once' ? '' : 'none';
 }
 
+const CRON_SCHEDULE_PRESETS = [
+  { id: 'custom', value: '', label: 'cron_schedule_preset_custom', fallback: 'Custom' },
+  { id: 'hourly', value: 'every 1h', label: 'cron_schedule_preset_hourly', fallback: 'Hourly' },
+  { id: 'daily', value: '0 9 * * *', label: 'cron_schedule_preset_daily', fallback: 'Daily' },
+  { id: 'weekdays', value: '0 9 * * 1-5', label: 'cron_schedule_preset_weekdays', fallback: 'Weekdays' },
+  { id: 'weekly', value: '0 9 * * 1', label: 'cron_schedule_preset_weekly', fallback: 'Weekly' },
+  { id: 'monthly', value: '0 9 1 * *', label: 'cron_schedule_preset_monthly', fallback: 'Monthly' },
+];
+
+function _cronSchedulePresetOptionHtml() {
+  return CRON_SCHEDULE_PRESETS
+    .map((preset) => `<option value="${preset.id}">${esc(t(preset.label) || preset.fallback)}</option>`)
+    .join('');
+}
+
+function _cronSchedulePresetIdForValue(value) {
+  const schedule = String(value || '').trim();
+  const preset = CRON_SCHEDULE_PRESETS.find((entry) => entry.value && entry.value === schedule);
+  return preset ? preset.id : 'custom';
+}
+
+function _syncCronSchedulePresetFromInput() {
+  const presetEl = $('cronFormSchedulePreset');
+  const scheduleEl = $('cronFormSchedule');
+  if (!presetEl || !scheduleEl) return;
+  const presetId = _cronSchedulePresetIdForValue(scheduleEl.value);
+  presetEl.value = presetId;
+}
+
+function _syncCronSchedulePresetAndWarning() {
+  _syncCronSchedulePresetFromInput();
+  _syncCronScheduleWarning();
+}
+
+function _applyCronSchedulePresetSelection() {
+  const presetEl = $('cronFormSchedulePreset');
+  const scheduleEl = $('cronFormSchedule');
+  if (!presetEl || !scheduleEl) return;
+  const presetId = presetEl.value;
+  const preset = CRON_SCHEDULE_PRESETS.find((entry) => entry.id === presetId);
+  if (preset && preset.value) scheduleEl.value = preset.value;
+  _syncCronSchedulePresetAndWarning();
+}
+
+function _initCronSchedulePresetControls() {
+  const presetEl = $('cronFormSchedulePreset');
+  const scheduleEl = $('cronFormSchedule');
+  if (!presetEl || !scheduleEl) return;
+  presetEl.addEventListener('change', _applyCronSchedulePresetSelection);
+  scheduleEl.addEventListener('input', _syncCronSchedulePresetAndWarning);
+  scheduleEl.addEventListener('change', _syncCronSchedulePresetAndWarning);
+  _syncCronSchedulePresetAndWarning();
+}
+
 function _hasUnlimitedRepeat(job) {
   return !!(job && job.repeat && job.repeat.times == null);
 }
@@ -1312,6 +1366,12 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
           <input type="text" id="cronFormName" value="${esc(name || '')}" placeholder="${esc(t('cron_name_placeholder') || 'Optional')}" autocomplete="off">
         </div>
         <div class="detail-form-row">
+          <label for="cronFormSchedulePreset">${esc(t('cron_schedule_preset_label') || 'Preset')}</label>
+          <select id="cronFormSchedulePreset">
+            ${_cronSchedulePresetOptionHtml()}
+          </select>
+        </div>
+        <div class="detail-form-row">
           <label for="cronFormSchedule">${esc(t('cron_schedule_label') || 'Schedule')}</label>
           <input type="text" id="cronFormSchedule" value="${esc(schedule || '')}" placeholder="0 9 * * *  —  every 1h  —  @daily" autocomplete="off" required>
           <div class="detail-form-hint">${esc(t('cron_schedule_hint') || "Cron expression or shorthand like 'every 1h'.")}</div>
@@ -1356,12 +1416,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   _populateCronDeliverOptions(deliver, isEdit);
   _populateCronFormModelSelect(model, provider, isNoAgent);
   if (!isNoAgent) _renderCronSkillTags();
-  const scheduleEl = $('cronFormSchedule');
-  if (scheduleEl) {
-    scheduleEl.addEventListener('input', _syncCronScheduleWarning);
-    scheduleEl.addEventListener('change', _syncCronScheduleWarning);
-    _syncCronScheduleWarning();
-  }
+  _initCronSchedulePresetControls();
   const focusEl = $('cronFormName');
   if (focusEl) focusEl.focus();
 }
