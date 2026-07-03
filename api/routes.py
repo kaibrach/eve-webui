@@ -2793,6 +2793,7 @@ from api.config import (
     SESSION_AGENT_LOCKS_LOCK,
     CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS,
     load_settings,
+    persisted_speech_settings_keys,
     save_settings,
     SETTINGS_FILE,
     set_hermes_default_model,
@@ -11446,6 +11447,7 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/settings":
         settings = load_settings()
+        settings["persisted_speech_keys"] = persisted_speech_settings_keys()
         # Never expose the stored password hash to clients
         settings.pop("password_hash", None)
         settings.setdefault("max_tokens", None)
@@ -14321,6 +14323,7 @@ def handle_post(handler, parsed) -> bool:
         from api.config import get_max_tokens_status, set_max_tokens
 
         saved = save_settings(body)
+        saved["persisted_speech_keys"] = persisted_speech_settings_keys()
         if max_tokens_provided:
             max_tokens_status = set_max_tokens(max_tokens_value)
         saved.pop("password_hash", None)  # never expose hash to client
