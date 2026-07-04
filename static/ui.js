@@ -11042,8 +11042,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     el.hidden=true;
   });
   const liveFooter=blocks.querySelector('#liveRunStatus');
-  let wrote=false;
-  const targetRenderedRows=[];
+  const renderedRows=[];
   for(const row of rows){
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
@@ -11059,8 +11058,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
       : node;
     if(existing) preserveByKey.delete(key);
     if(!renderedNode) continue;
-    targetRenderedRows.push(renderedNode);
-    wrote=true;
+    renderedRows.push(renderedNode);
   }
   const transparentLiveRowAlreadyPositioned=(node, expectedNextSibling)=>!!(
     node &&
@@ -11068,8 +11066,8 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     node.nextSibling===expectedNextSibling
   );
   let expectedNextSibling=(liveFooter&&liveFooter.parentElement===blocks) ? liveFooter : null;
-  for(let i=targetRenderedRows.length-1;i>=0;i--){
-    const renderedNode=targetRenderedRows[i];
+  for(let i=renderedRows.length-1;i>=0;i--){
+    const renderedNode=renderedRows[i];
     if(transparentLiveRowAlreadyPositioned(renderedNode,expectedNextSibling)){
       expectedNextSibling=renderedNode;
       continue;
@@ -11079,7 +11077,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     expectedNextSibling=renderedNode;
   }
   preserveByKey.forEach(stale=>stale.remove());
-  if(wrote) _syncTransparentEventControls(turn);
+  if(renderedRows.length) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
   if(scrollRebuildGuard&&scrollRebuildGuard.release){
@@ -11089,7 +11087,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     });
   }
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
-  return wrote;
+  return !!renderedRows.length;
 }
 
 function _transparentLiveRowKey(node, streamId){
@@ -11184,6 +11182,69 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   return true;
 }
 
+function _appendTransparentFadeText(body, text){
+  if(!body) return;
+  const value = String(text || '');
+  if(!value) return;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const frag = document.createDocumentFragment();
+  const wordRe = /(\S+)(\s*)/g;
+  let last = 0, match, changed = false;
+  while((match = wordRe.exec(value))){
+    if(match.index > last) frag.appendChild(document.createTextNode(value.slice(last, match.index)));
+    if(reduceMotion){
+      frag.appendChild(document.createTextNode(match[1]));
+    }else{
+      const span = document.createElement('span');
+      span.className = 'stream-fade-word is-new';
+      span.textContent = match[1];
+      frag.appendChild(span);
+    }
+    if(match[2]) frag.appendChild(document.createTextNode(match[2]));
+    last = match.index + match[0].length;
+    changed = true;
+  }
+  if(!changed) frag.appendChild(document.createTextNode(value));
+  else if(last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
+  body.appendChild(frag);
+}
+
+function _refreshTransparentFadeProseRow(existing, node, preservedState){
+  let body = existing.querySelector ? existing.querySelector('.msg-body') : null;
+  const nextText = String((node.dataset && node.dataset.rawText) || (node.textContent || ''));
+  const currentText = String(existing.getAttribute('data-stream-fade-text') || (body && body.textContent) || '');
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  if(!body){
+    body = document.createElement('div');
+    body.className = 'msg-body';
+    existing.appendChild(body);
+  }
+  if(body.classList) body.classList.add('stream-fade-active');
+  if(!nextText.startsWith(currentText)){
+    body.textContent = '';
+    existing.setAttribute('data-stream-fade-text', '');
+    _appendTransparentFadeText(body, nextText);
+  }else{
+    _appendTransparentFadeText(body, nextText.slice(currentText.length));
+  }
+  existing.setAttribute('data-stream-fade-text', nextText);
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  return existing;
+}
+
 function _refreshTransparentLiveRow(existing, node){
   if(!existing || !node || !existing.getAttribute) return node;
   if(existing===node) return existing;
@@ -11192,13 +11253,7 @@ function _refreshTransparentLiveRow(existing, node){
     node.querySelector &&
     !!node.querySelector('.msg-body.stream-fade-active,.stream-fade-word');
   if(candidateIsFadeProse){
-    const parent = existing.parentNode;
-    if(parent){
-      parent.insertBefore(node, existing);
-      existing.remove();
-    }
-    _rehydrateTransparentLiveRow(node, node, preservedState);
-    return node;
+    return _refreshTransparentFadeProseRow(existing, node, preservedState);
   }
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
