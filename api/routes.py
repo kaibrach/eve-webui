@@ -13694,8 +13694,17 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         sid = body["session_id"]
         with _get_session_agent_lock(sid):
+            had_sidecar_messages = bool(s.messages or [])
             s.messages = []
             s.tool_calls = []
+            s.context_messages = []
+            s.truncation_watermark = 0.0
+            s.truncation_boundary = 0.0
+            s.active_stream_id = None
+            s.pending_user_message = None
+            s.pending_attachments = []
+            s.pending_started_at = None
+            s.pending_user_source = None
             # Reset the title via the rename helper so clearing a manually-named
             # session also clears manual_title/llm_title_generated — otherwise the
             # reused session keeps its manual-title protection and never auto-names
@@ -13703,6 +13712,27 @@ def handle_post(handler, parsed) -> bool:
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, "Untitled")
             s.save()
+            persisted_clear = False
+            try:
+                persisted = json.loads(s.path.read_text(encoding="utf-8"))
+                persisted_clear = (
+                    persisted.get("messages") == []
+                    and persisted.get("context_messages") == []
+                    and persisted.get("truncation_watermark") == 0.0
+                    and persisted.get("truncation_boundary") == 0.0
+                    and persisted.get("active_stream_id") is None
+                    and persisted.get("pending_user_message") is None
+                    and persisted.get("pending_attachments") == []
+                    and persisted.get("pending_started_at") is None
+                    and persisted.get("pending_user_source") is None
+                )
+            except (OSError, json.JSONDecodeError, ValueError):
+                logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
+            if had_sidecar_messages and persisted_clear:
+                try:
+                    s.path.with_suffix('.json.bak').unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
