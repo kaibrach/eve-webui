@@ -2824,6 +2824,7 @@ from api.config import (
     _load_yaml_config_file,
     _save_yaml_config_file,
     reload_config,
+    get_config_for_profile_home,
     _cfg_lock,
     PENDING_BG_TASK_COMPLETIONS,
 )
@@ -24315,7 +24316,7 @@ def _mcp_tools_from_registry(server_summaries):
 
 def _handle_mcp_tools_list(handler):
     """List known MCP tools from already-available runtime inventory only."""
-    cfg = get_config()
+    cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}
@@ -24829,7 +24830,7 @@ def _handle_notes_item(handler, parsed):
 
 def _handle_mcp_servers_list(handler):
     """List configured MCP servers with safe, read-only runtime visibility."""
-    cfg = get_config()
+    cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}
