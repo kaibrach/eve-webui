@@ -11,6 +11,8 @@
 
 ### Fixed
 
+- **A stuck or half-open gateway connection no longer pins a turn for 10 minutes ignoring Stop.** Gateway SSE reads now carry a bounded byte-silence budget (default 600s, env-tunable via `HERMES_WEBUI_GATEWAY_READ_TIMEOUT`) and treat a read timeout as terminal — so pressing Stop during a silent stall ends the turn cleanly instead of waiting out the full timeout. The 600s default preserves the prior budget so legitimately long, silent tool calls are not cut off. Thanks @ai-ag2026. (#5789, #2476)
+
 - **Session loading is faster — addresses the "WebUI feels laggy" reports.** The session-load path (`/api/sessions` + session-by-id) had redundant full-metadata reads on every request; it now uses a profile-scoped, content-verified, lock-guarded cache (capped at 32 entries) with a fast path that only serves cached data when disk state is provably fresh, falling back to full comparison otherwise. Response shape and profile-scoping are unchanged. Thanks @Kopamed. (#5803, #5455)
 
 - **The background-wakeup status-row label is now localized.** The "Background wakeup" label introduced with the wakeup status row (#5766) was hardcoded English; it now resolves through `t('process_wakeup_label')`, with translations in all 15 locales. Thanks @Isla-Liu. (#5768)
