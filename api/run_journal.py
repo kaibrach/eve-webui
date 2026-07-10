@@ -23,6 +23,7 @@ _FSYNC_MODE_EAGER = "eager"
 _FSYNC_MODE_TERMINAL_ONLY = "terminal-only"
 _SESSION_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 _SESSION_REPLAY_MAX_ROWS = 4096
+_SESSION_REPLAY_READ_CHUNK_BYTES = 64 * 1024
 
 
 def _default_session_dir() -> Path:
@@ -150,6 +151,42 @@ def _event_created_at(event: dict, *, fallback: float = 0.0) -> float:
         return float(event.get("created_at") or fallback)
     except (TypeError, ValueError):
         return fallback
+
+
+def _iter_bounded_raw_jsonl_lines(path: Path, *, max_bytes: int, retained_bytes: int = 0):
+    line_no = 0
+    buffered = bytearray()
+    total_bytes = int(retained_bytes)
+    try:
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(_SESSION_REPLAY_READ_CHUNK_BYTES)
+                if not chunk:
+                    if buffered:
+                        if total_bytes + len(buffered) > max_bytes:
+                            raise ValueError("replay_limit_bytes")
+                        line_no += 1
+                        total_bytes += len(buffered)
+                        yield line_no, bytes(buffered), total_bytes
+                    return
+                start = 0
+                while start < len(chunk):
+                    newline = chunk.find(b"\n", start)
+                    if newline == -1:
+                        buffered.extend(chunk[start:])
+                        if total_bytes + len(buffered) > max_bytes:
+                            raise ValueError("replay_limit_bytes")
+                        break
+                    buffered.extend(chunk[start : newline + 1])
+                    if total_bytes + len(buffered) > max_bytes:
+                        raise ValueError("replay_limit_bytes")
+                    line_no += 1
+                    total_bytes += len(buffered)
+                    yield line_no, bytes(buffered), total_bytes
+                    buffered.clear()
+                    start = newline + 1
+    except FileNotFoundError:
+        return
 
 
 def append_run_event(
@@ -339,32 +376,36 @@ def read_session_run_events(
         events: list[dict] = []
         expected_seq = 1
         try:
-            with path.open(encoding="utf-8") as fh:
-                for raw in fh:
-                    retained_bytes += len(raw.encode("utf-8"))
-                    if retained_bytes > max_bytes:
-                        return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_limit_bytes", "events": []}
-                    if not raw.strip():
-                        continue
-                    try:
-                        event = json.loads(raw)
-                        seq = int(event.get("seq")) if isinstance(event, dict) else 0
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_malformed", "events": []}
-                    if (
-                        seq != expected_seq
-                        or event.get("event_id") != f"{run_id}:{seq}"
-                        or event.get("run_id") != run_id
-                        or event.get("session_id") != sid
-                    ):
-                        return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_noncontiguous", "events": []}
-                    expected_seq += 1
-                    retained_rows += 1
-                    if retained_rows > max_rows:
-                        return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_limit_rows", "events": []}
-                    events.append(event)
+            for _line_no, raw, retained_bytes in _iter_bounded_raw_jsonl_lines(
+                path,
+                max_bytes=max_bytes,
+                retained_bytes=retained_bytes,
+            ):
+                if not raw.strip():
+                    continue
+                try:
+                    event = json.loads(raw.decode("utf-8"))
+                    seq = int(event.get("seq")) if isinstance(event, dict) else 0
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                    return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_malformed", "events": []}
+                if (
+                    seq != expected_seq
+                    or event.get("event_id") != f"{run_id}:{seq}"
+                    or event.get("run_id") != run_id
+                    or event.get("session_id") != sid
+                ):
+                    return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_noncontiguous", "events": []}
+                expected_seq += 1
+                retained_rows += 1
+                if retained_rows > max_rows:
+                    return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_limit_rows", "events": []}
+                events.append(event)
         except FileNotFoundError:
             continue
+        except ValueError as exc:
+            if str(exc) == "replay_limit_bytes":
+                return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "replay_limit_bytes", "events": []}
+            raise
         created_at = min((_event_created_at(event) for event in events), default=path.stat().st_mtime)
         runs.append((created_at, run_id, events))
     runs.sort(key=lambda run: (run[0], run[1]))
@@ -383,7 +424,7 @@ def read_session_run_events(
             "events": [],
         }
     cursor_events = runs[cursor_index][2]
-    if cursor_seq is None or cursor_seq >= len(cursor_events):
+    if cursor_seq is None or cursor_seq > len(cursor_events):
         return {"session_id": sid, "cursor_run_id": cursor_run_id, "cursor_seq": cursor_seq, "status": "cursor_event_missing", "events": []}
     replay_events = [event for event in cursor_events if event["seq"] > cursor_seq]
     for _created_at, _run_id, events in runs[cursor_index + 1:]:

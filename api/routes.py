@@ -16203,13 +16203,20 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
             if event_id:
                 note_sent_event_id(event_id)
 
+    def emit_session_snapshot(active_stream_id):
+        try:
+            fresh_session = get_session(session_id, metadata_only=True)
+        except KeyError:
+            fresh_session = session
+        _sse(handler, "session_snapshot", _session_snapshot_payload(fresh_session, active_stream_id=active_stream_id))
+
     try:
         replay_events = []
         replay_ok = False
         if resume_event_id:
             replay = read_session_run_events(session_id, after_event_id=resume_event_id)
             if replay.get("status") != "ok":
-                _sse(handler, "session_snapshot", _session_snapshot_payload(session, active_stream_id=active_stream_id))
+                emit_session_snapshot(active_stream_id)
             else:
                 replay_ok = True
                 replay_events = replay.get("events") or []
@@ -16231,6 +16238,8 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
             reconciled = read_session_run_events(session_id, after_event_id=resume_event_id)
             if reconciled.get("status") == "ok":
                 emit_replay(reconciled.get("events") or [], active_stream_id, replay_cutoff_seq)
+            else:
+                emit_session_snapshot(active_stream_id)
         try:
             while True:
                 try:

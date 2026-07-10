@@ -214,6 +214,35 @@ def test_session_journal_rejects_bounds_and_invalid_contiguous_rows(tmp_path):
     assert invalid["events"] == []
 
 
+def test_session_journal_rejects_oversized_line_before_decode(tmp_path, monkeypatch):
+    path = tmp_path / "_run_journal" / "session_1" / "run_a.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = '{"event_id":"run_a:1","seq":1,"run_id":"run_a","session_id":"session_1","event":"done","type":"done","payload":{"text":"' + ("x" * 5000) + '"}}\n'
+    path.write_bytes(payload.encode("utf-8"))
+    monkeypatch.setattr("api.run_journal.json.loads", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("oversized line should not decode")))
+
+    limited = read_session_run_events("session_1", after_event_id="run_a:1", session_dir=tmp_path, max_bytes=1024)
+
+    assert limited["status"] == "replay_limit_bytes"
+    assert limited["events"] == []
+
+
+def test_session_journal_accepts_line_at_cap_and_rejects_next_byte(tmp_path):
+    path = tmp_path / "_run_journal" / "session_1" / "run_a.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = '{"event_id":"run_a:1","seq":1,"run_id":"run_a","session_id":"session_1","event":"done","type":"done","payload":{"text":"ok"}}\n'
+    path.write_bytes(payload.encode("utf-8"))
+    cap = len(payload.encode("utf-8"))
+
+    at_cap = read_session_run_events("session_1", after_event_id="run_a:1", session_dir=tmp_path, max_bytes=cap)
+    over = read_session_run_events("session_1", after_event_id="run_a:1", session_dir=tmp_path, max_bytes=cap - 1)
+
+    assert at_cap["status"] == "ok"
+    assert at_cap["events"] == []
+    assert over["status"] == "replay_limit_bytes"
+    assert over["events"] == []
+
+
 def test_session_journal_requires_exact_cursor_and_contiguous_suffix(tmp_path):
     append_run_event("session_1", "run_a", "token", {}, session_dir=tmp_path, seq=1)
     exact_missing = read_session_run_events("session_1", after_event_id="run_a:2", session_dir=tmp_path)
@@ -224,6 +253,16 @@ def test_session_journal_requires_exact_cursor_and_contiguous_suffix(tmp_path):
     assert exact_missing["status"] != "ok"
     assert exact_missing["events"] == []
     assert gap["events"] == []
+
+
+def test_session_journal_accepts_final_cursor_and_replays_later_runs(tmp_path):
+    append_run_event("session_1", "run_a", "token", {}, session_dir=tmp_path, seq=1, created_at=100.0)
+    append_run_event("session_1", "run_b", "token", {}, session_dir=tmp_path, seq=1, created_at=200.0)
+
+    replay = read_session_run_events("session_1", after_event_id="run_a:1", session_dir=tmp_path)
+
+    assert replay["status"] == "ok"
+    assert [event["event_id"] for event in replay["events"]] == ["run_b:1"]
 
 
 def test_session_route_prefers_last_event_id_then_query_fallback(monkeypatch):
@@ -552,6 +591,60 @@ def test_session_route_reconciles_late_attach_cutoff_once(monkeypatch):
     assert body.count("id: run_active:6\n") == 1
     assert "id: run_active:7\n" in body
     assert stream.unsubscribed == 1
+
+
+def test_session_route_emits_snapshot_when_reconciliation_fails(monkeypatch):
+    import api.routes as routes
+
+    class _FakeStream:
+        def __init__(self):
+            self.q = queue.Queue()
+            self.q.put_nowait(("token", {"text": "buffered"}, "run_active:1"))
+            self.q.put_nowait(("stream_end", {"status": "done"}, "run_active:2"))
+
+        def subscribe_with_snapshot(self):
+            return self.q, {"last_event_id": "run_active:1"}
+
+    stream = _FakeStream()
+    reads = []
+    sessions = iter(
+        [
+            SimpleNamespace(session_id="session_1", compact=lambda **_kwargs: {"session_id": "session_1", "title": "stale"}),
+            SimpleNamespace(session_id="session_1", compact=lambda **_kwargs: {"session_id": "session_1", "title": "fresh"}),
+        ]
+    )
+    monkeypatch.setattr(routes, "_session_id_visible_to_request_profile", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda sid, metadata_only=False: next(sessions),
+    )
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: "run_active")
+    monkeypatch.setattr(routes, "STREAMS", {"run_active": stream})
+    monkeypatch.setattr(
+        routes,
+        "read_session_run_events",
+        lambda *_args, **_kwargs: reads.append(1) or (
+            {"status": "ok", "events": [{"event": "token", "payload": {"text": "replayed"}, "event_id": "run_prev:1"}]}
+            if len(reads) == 1
+            else {"status": "replay_noncontiguous", "events": []}
+        ),
+    )
+
+    handler = _FakeHandler()
+    routes._handle_session_sse_stream_for_session(
+        handler,
+        urlparse("/api/sessions/session_1/events?after_event_id=run_prev:0"),
+        "session_1",
+    )
+
+    body = handler.wfile.getvalue().decode("utf-8")
+    assert "event: session_snapshot\n" in body
+    assert '"title": "fresh"' in body
+    assert '"title": "stale"' not in body
+    assert "id: run_prev:1\n" not in body
+    assert body.count("id: run_active:1\n") == 0
+    assert "id: run_active:2\n" in body
 
 
 def test_session_route_bounds_sent_event_id_deduplication(monkeypatch):
