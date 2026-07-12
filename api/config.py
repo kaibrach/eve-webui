@@ -2354,6 +2354,57 @@ def _is_local_server_provider(provider_id: str) -> bool:
     return False
 
 
+def _model_id_declared_in_config(model_id: str, config_provider: str | None) -> bool:
+    """True when the user's own config declares ``model_id`` verbatim (full form).
+
+    This is the COLD-catalog provenance signal for #5979: when the live
+    ``/v1/models`` catalog is unbuilt (fresh process, headless client), a
+    vendor-namespaced id the user configured — ``model.default``, the
+    ``model.models`` allowlist, or the matching ``custom_providers[].models`` /
+    ``.model`` for a named ``custom:<slug>`` — is still authoritative provenance
+    that the full id is intentional and must be preserved. Config is the one
+    source available with zero network and no catalog dependency, so it survives
+    a cold restart (b3nw's ``model.default: x-ai/grok-4.5``). Checked ONLY for
+    custom providers; returns False for anything not verbatim-declared so the
+    caller falls through to the legacy family heuristic.
+    """
+    model = str(model_id or "").strip()
+    if not model:
+        return False
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, dict):
+        if str(model_cfg.get("default") or "").strip() == model:
+            return True
+        _declared = model_cfg.get("models")
+        if isinstance(_declared, dict) and model in _declared:
+            return True
+        if isinstance(_declared, list) and any(
+            (str(m.get("id") or "").strip() if isinstance(m, dict) else str(m or "").strip()) == model
+            for m in _declared
+        ):
+            return True
+    # Named custom:<slug> — scan its custom_providers[] entry for a verbatim id.
+    prov = str(config_provider or "").strip().lower()
+    if prov.startswith("custom:"):
+        raw_suffix = prov.removeprefix("custom:")
+        for entry in _custom_provider_entries():
+            slug = _custom_provider_slug_from_name(entry.get("name"))
+            entry_name = str(entry.get("name") or "").strip().lower()
+            if not (prov in {entry_name, slug} or (slug and raw_suffix == slug.removeprefix("custom:"))):
+                continue
+            if str(entry.get("model") or "").strip() == model:
+                return True
+            _em = entry.get("models")
+            if isinstance(_em, dict) and model in _em:
+                return True
+            if isinstance(_em, list) and any(
+                (str(m.get("id") or "").strip() if isinstance(m, dict) else str(m or "").strip()) == model
+                for m in _em
+            ):
+                return True
+    return False
+
+
 def _is_first_party_model(provider_id: str, model_id: str) -> bool:
     """True when ``model_id`` is listed in ``provider_id``'s own static catalog.
 
@@ -2809,7 +2860,7 @@ def resolve_model_provider(model_id: str) -> tuple:
             _cp_lower = (config_provider or "").strip().lower()
             _is_custom = _cp_lower == "custom" or _cp_lower.startswith("custom:")
             if _is_custom:
-                # Vendor-routing proxy: the ONLY reliable signal for whether the
+                # Vendor-routing proxy: the reliable signal for whether the
                 # endpoint wants the full ``vendor/model`` id or the bare id is
                 # what its own catalog actually advertised (the ids the user
                 # picked from the dropdown, populated by the endpoint's live
@@ -2823,10 +2874,17 @@ def resolve_model_provider(model_id: str) -> tuple:
                 # structurally identical to the family heuristic, so a model
                 # graduating into a first-party catalog (agent commit 62ada5175
                 # adding grok-4.5) silently flipped a working custom-proxy id from
-                # preserved to stripped. Provenance tells them apart:
+                # preserved to stripped. Tri-state provenance tells them apart:
+                #
+                # (1) Config declares the full id verbatim (model.default /
+                #     model.models / custom_providers[].models). Authoritative and
+                #     network-free, so #5979 survives a cold restart — preserve.
+                if _model_id_declared_in_config(model_id, config_provider):
+                    return model_id, config_provider, config_base_url
+                # (2) The endpoint's live/cached catalog advertised it.
                 _advertised = _endpoint_advertised_model_ids(config_provider)
                 if _advertised:
-                    # Full id advertised → the endpoint routes on it verbatim (#5979/#3872/#548).
+                    # Full id advertised → route on it verbatim (#5979/#3872/#548).
                     if model_id in _advertised:
                         return model_id, config_provider, config_base_url
                     # ONLY the bare id advertised → the prefix is a redundant
@@ -2835,14 +2893,20 @@ def resolve_model_provider(model_id: str) -> tuple:
                     # advertising a bare id can't strip an unknown-vendor prefix.
                     if bare in _advertised and prefix in _PROVIDER_MODELS:
                         return bare, config_provider, config_base_url
-                # Cold/unbuilt catalog OR neither shape advertised → preserve the
-                # id verbatim. This is the fail-SAFE default: a wrong strip would
-                # destroy a namespace the user actively selected this session
-                # (recurs every turn, unrepairable — the info is gone), while a
-                # wrong preserve only mis-sends a stale leftover that fails loudly
-                # and self-heals the moment the catalog builds. Matches the
-                # agent's own normalize_model_for_provider (custom = pass-through)
-                # and the #4210 no-base_url custom behaviour.
+                    # Advertised but neither exact shape matched → intrinsic /
+                    # unknown prefix the proxy routes on; preserve it whole.
+                    return model_id, config_provider, config_base_url
+                # (3) Provenance genuinely unavailable (cold/unbuilt or
+                #     fingerprint-mismatched catalog AND not config-declared).
+                #     Fall back to the LEGACY family heuristic so this narrow edge
+                #     is never WORSE than the pre-fix behaviour: a first-party
+                #     redundant prefix still strips (#433 relay works cold), while
+                #     an intrinsic/unknown prefix (bedrock/opus-4-6 #3872,
+                #     zai-org/GLM-5.1 #548) is preserved. The #5979 active-user
+                #     path can't reach here — a selected id is either config-
+                #     declared or in the catalog the dropdown was built from.
+                if prefix in _PROVIDER_MODELS and _is_first_party_model(prefix, bare):
+                    return bare, config_provider, config_base_url
                 return model_id, config_provider, config_base_url
             # Non-custom first-party provider pointed at an OpenAI-compatible
             # proxy (e.g. provider=openai + base_url=litellm): the bare id is
@@ -4576,54 +4640,68 @@ def _endpoint_advertised_model_ids(provider_id: str | None) -> frozenset | None:
     something this custom endpoint advertised.
     """
     global _advertised_model_ids_memo
-    snapshot = _available_models_cache  # atomic reference read; publishes replace wholesale
-    if snapshot is None:
-        return None
-    # Profile-isolation fail-safe (profiles are islands): the catalog cache is a
-    # process global, so a concurrently-active profile could have published the
-    # snapshot we're now reading. Only trust it for provenance when its published
-    # source fingerprint still matches the current runtime fingerprint — the
-    # ``config_yaml`` axis of that fingerprint is the PROFILE-SPECIFIC config path
-    # (_get_config_path -> get_active_hermes_home), so a match guarantees the
-    # snapshot belongs to the profile asking. Any mismatch (foreign profile,
-    # config edit, cold fingerprint) returns None so the caller preserves the id
-    # verbatim rather than stripping against another profile's catalog.
-    try:
-        if _available_models_cache_source_fingerprint != _models_cache_source_fingerprint():
+    # Read the snapshot AND its source fingerprint together under the catalog
+    # lock so we can never observe a torn pair: publishes assign
+    # _available_models_cache and _available_models_cache_source_fingerprint as
+    # two separate statements (always inside this same lock), so an unlocked
+    # reader could otherwise catch a freshly-published FOREIGN snapshot still
+    # paired with the PREVIOUS profile's (matching) fingerprint and strip against
+    # the wrong catalog. The lock is an RLock and every publish holds it only for
+    # the two assignments — the expensive network rebuild happens BEFORE the
+    # publish block — so this per-send acquisition contends only with the atomic
+    # publish, never with a live provider probe.
+    with _available_models_cache_lock:
+        snapshot = _available_models_cache
+        published_fp = _available_models_cache_source_fingerprint
+        if snapshot is None:
             return None
-    except Exception:
-        return None  # fingerprint unavailable → no trustworthy provenance
-    memo = _advertised_model_ids_memo
-    # Identity check (``is``), not id(): holding the snapshot reference in the
-    # memo keeps it alive, so a freed-then-reused id() can't cause a false hit.
-    if memo is None or memo[0] is not snapshot:
-        by_slug: dict[str, frozenset] = {}
+        # Profile-isolation fail-safe (profiles are islands): the catalog cache
+        # is a process global, so a concurrently-active profile could have
+        # published the snapshot we're now reading. Only trust it for provenance
+        # when its published source fingerprint still matches the current runtime
+        # fingerprint — the ``config_yaml`` axis of that fingerprint is the
+        # PROFILE-SPECIFIC config path (_get_config_path -> get_active_hermes_home),
+        # so a match guarantees the snapshot belongs to the profile asking. Any
+        # mismatch (foreign profile, config edit, cold fingerprint) returns None
+        # so the caller preserves the id verbatim rather than stripping against
+        # another profile's catalog.
         try:
-            groups = snapshot.get("groups", []) or []
-        except AttributeError:
-            return None
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            slug = str(group.get("provider_id") or "").strip().lower()
-            if not slug:
-                continue
-            # Union BOTH catalog buckets: a provider's models can be split across
-            # ``models`` (visible) and ``extra_models`` (overflow) by the picker,
-            # so an id the endpoint genuinely advertised may live in either. Only
-            # reading ``models`` would miss it and mis-resolve (e.g. leave the
-            # #433 bare id unstripped because it sits in extra_models).
-            ids = frozenset(
-                str(m.get("id"))
-                for bucket in ("models", "extra_models")
-                for m in (group.get(bucket) or [])
-                if isinstance(m, dict) and m.get("id")
-            )
-            by_slug[slug] = by_slug.get(slug, frozenset()) | ids
-        memo = (snapshot, by_slug)
-        _advertised_model_ids_memo = memo
-    slug = str(provider_id or "").strip().lower()
-    return memo[1].get(slug)
+            if published_fp != _models_cache_source_fingerprint():
+                return None
+        except Exception:
+            return None  # fingerprint unavailable → no trustworthy provenance
+        memo = _advertised_model_ids_memo
+        # Identity check (``is``), not id(): holding the snapshot reference in the
+        # memo keeps it alive, so a freed-then-reused id() can't cause a false hit.
+        if memo is None or memo[0] is not snapshot:
+            by_slug: dict[str, frozenset] = {}
+            try:
+                groups = snapshot.get("groups", []) or []
+            except AttributeError:
+                return None
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                slug = str(group.get("provider_id") or "").strip().lower()
+                if not slug:
+                    continue
+                # Union BOTH catalog buckets: a provider's models can be split
+                # across ``models`` (visible) and ``extra_models`` (overflow) by
+                # the picker, so an id the endpoint genuinely advertised may live
+                # in either. Only reading ``models`` would miss it and mis-resolve
+                # (e.g. leave the #433 bare id unstripped because it sits in
+                # extra_models).
+                ids = frozenset(
+                    str(m.get("id"))
+                    for bucket in ("models", "extra_models")
+                    for m in (group.get(bucket) or [])
+                    if isinstance(m, dict) and m.get("id")
+                )
+                by_slug[slug] = by_slug.get(slug, frozenset()) | ids
+            memo = (snapshot, by_slug)
+            _advertised_model_ids_memo = memo
+        slug = str(provider_id or "").strip().lower()
+        return memo[1].get(slug)
 
 
 # Hard wall-clock budget for a COLD live provider-catalog rebuild when it is

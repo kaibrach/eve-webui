@@ -283,28 +283,58 @@ def test_named_custom_slug_preserves_advertised_full_id_5979():
     assert model == 'x-ai/grok-4.5', f"full id must be preserved for custom:slug, got {model!r}"
 
 
-def test_custom_remote_cold_catalog_preserves_verbatim_5979():
-    """#5979 fail-safe: with a COLD/unbuilt catalog (no provenance signal), a
-    custom proxy preserves the model id verbatim — for BOTH the advertised-full
-    case and the stale-leftover case.
+def test_custom_remote_cold_catalog_falls_back_to_legacy_heuristic_5979():
+    """#5979 tri-state: with a COLD/unbuilt catalog AND no config declaration
+    (no provenance at all), resolution falls back to the LEGACY family heuristic
+    so this narrow edge is never worse than the pre-fix behaviour.
 
-    Preserve is the correct cold default: a wrong strip destroys a namespace the
-    user actively selected this session (recurs every turn, unrepairable), while
-    a wrong preserve only mis-sends a stale leftover that fails loudly and heals
-    the instant the catalog builds. The active-user-selection case (#5979) is
-    cold-safe by construction — you can't select from a dropdown that was never
-    built.
+    A first-party redundant prefix still strips (the #433 relay keeps working
+    cold), while an intrinsic/unknown prefix is preserved. The #5979 active-user
+    path never reaches this branch — a selected id is either config-declared
+    (see the config-declared test) or in the catalog the dropdown was built from.
     """
+    # first-party redundant prefix → strip (matches pre-fix / #433 cold path)
     model_a, _, _ = _resolve_with_catalog(
-        'x-ai/grok-4.5', advertised_ids=None,
-        provider='custom', base_url='https://proxy.example.com/v1',
-    )
-    assert model_a == 'x-ai/grok-4.5', f"cold catalog must preserve verbatim, got {model_a!r}"
-    model_b, _, _ = _resolve_with_catalog(
         'openai/gpt-5.4', advertised_ids=None,
         provider='custom', base_url='https://router.example.com/v1',
     )
-    assert model_b == 'openai/gpt-5.4', f"cold catalog must preserve verbatim, got {model_b!r}"
+    assert model_a == 'gpt-5.4', f"cold first-party prefix must strip (legacy), got {model_a!r}"
+    # intrinsic/unknown prefix → preserve
+    model_b, _, _ = _resolve_with_catalog(
+        'zai-org/GLM-5.1', advertised_ids=None,
+        provider='custom', base_url='https://api.deepinfra.com/v1/openai',
+    )
+    assert model_b == 'zai-org/GLM-5.1', f"cold unknown prefix must preserve, got {model_b!r}"
+
+
+def test_custom_remote_config_declared_full_id_preserved_cold_5979():
+    """#5979 cold-restart survival: even with a COLD catalog, a full vendor id
+    the user DECLARED in config (model.default) is preserved — config is
+    network-free provenance that outlives a process restart.
+    """
+    old_cache = config._available_models_cache
+    old_memo = config._advertised_model_ids_memo
+    old_fp = config._available_models_cache_source_fingerprint
+    old_cfg = dict(config.cfg)
+    config._available_models_cache = None  # cold
+    config._advertised_model_ids_memo = None
+    config.cfg['model'] = {
+        'provider': 'custom',
+        'default': 'x-ai/grok-4.5',  # user-declared full id
+        'base_url': 'https://proxy.example.com/v1',
+    }
+    try:
+        model, provider, _ = config.resolve_model_provider('x-ai/grok-4.5')
+    finally:
+        config._available_models_cache = old_cache
+        config._advertised_model_ids_memo = old_memo
+        config._available_models_cache_source_fingerprint = old_fp
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+    assert model == 'x-ai/grok-4.5', (
+        f"config-declared full id must survive a cold catalog, got {model!r}"
+    )
+    assert provider == 'custom'
 
 
 def test_custom_remote_prefers_full_id_when_both_advertised_5979():
@@ -348,32 +378,37 @@ def test_custom_remote_extra_models_bucket_counts_as_advertised_5979():
     assert model == 'gpt-5.4', f"bare id in extra_models must count as advertised, got {model!r}"
 
 
-def test_custom_remote_foreign_profile_catalog_preserves_verbatim_5979():
+def test_custom_remote_foreign_profile_catalog_ignored_5979():
     """Profile-isolation fail-safe: when the catalog snapshot's source
     fingerprint does NOT match the current runtime (a concurrently-active
-    foreign profile published it), provenance is untrusted and the id is
-    preserved verbatim — never stripped against another profile's catalog.
+    foreign profile published it), that snapshot is NOT trusted for provenance —
+    resolution falls back to the legacy family heuristic instead of stripping
+    against another profile's catalog.
+
+    Proof id: ``zai-org/GLM-5.1``. The foreign snapshot advertises a bare
+    ``GLM-5.1`` (which, if trusted, would strip the prefix), but ``zai-org`` is
+    NOT a first-party provider, so the legacy fallback preserves the full id.
+    A result of ``zai-org/GLM-5.1`` therefore proves the foreign catalog was
+    ignored (a trusted-catalog strip would have returned ``GLM-5.1``).
     """
     old_cache = config._available_models_cache
     old_memo = config._advertised_model_ids_memo
     old_fp = config._available_models_cache_source_fingerprint
-    # Snapshot advertises ONLY the bare id (would normally strip openai/gpt-5.4),
-    # but the fingerprint is a deliberate mismatch (a foreign profile's stamp).
     config._available_models_cache = {
-        'groups': [{'provider_id': 'custom', 'models': [{'id': 'gpt-5.4', 'label': 'gpt-5.4'}]}]
+        'groups': [{'provider_id': 'custom', 'models': [{'id': 'GLM-5.1', 'label': 'GLM-5.1'}]}]
     }
     config._available_models_cache_source_fingerprint = {'config_yaml': {'path': '/some/other/profile'}}
     config._advertised_model_ids_memo = None
     try:
         model, _, _ = _resolve_with_config(
-            'openai/gpt-5.4', provider='custom', base_url='https://relay.example/v1',
+            'zai-org/GLM-5.1', provider='custom', base_url='https://relay.example/v1',
         )
     finally:
         config._available_models_cache = old_cache
         config._advertised_model_ids_memo = old_memo
         config._available_models_cache_source_fingerprint = old_fp
-    assert model == 'openai/gpt-5.4', (
-        f"foreign-profile catalog must not strip; expected verbatim, got {model!r}"
+    assert model == 'zai-org/GLM-5.1', (
+        f"foreign-profile catalog must be ignored (legacy fallback preserves), got {model!r}"
     )
 
 
