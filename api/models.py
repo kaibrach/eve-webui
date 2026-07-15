@@ -54,10 +54,12 @@ WEBHOOK_PROJECT_CHIP_LIMIT = 200
 _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 # While a turn is actively streaming, hold the CLI/cron projection longer than
 # one poll interval (mirrors the route-level #4808 hold-down). The frontend
-# polls /api/sessions every ~5s during a stream; without a wider window the
-# CLI cache key advances on every streamed message row (see below) and the
-# expensive state.db CLI/cron projection is re-run on every poll. (#4842)
-_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 30.0
+# polls /api/sessions on the static/sessions.js `_streamingPollMs` cadence.
+# Pair this wider window with the stable streaming cache key below so repeated
+# polls reuse the projection instead of re-running the expensive state.db
+# CLI/cron projection. (#4842) Keep this strictly greater than
+# `_streamingPollMs`/1000 (see tests/test_streaming_cache_ttl_vs_poll.py).
+_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 45.0
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE_INFLIGHT: "dict[tuple, threading.Event]" = {}
 _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
@@ -93,7 +95,7 @@ _CLAUDE_CODE_PARSE_CACHE_MAX = 1000
 # ~200 sidecar file reads per /api/sessions build — and because the enclosing
 # _CLI_SESSIONS_CACHE is keyed on a state.db content fingerprint that advances
 # on every streamed message row, that whole scan was re-paid on essentially
-# every 5s poll during a live turn (the "100% CPU / multi-second get_cli_sessions"
+# every streaming poll during a live turn (the "100% CPU / multi-second get_cli_sessions"
 # in #4842/#4808/#4672). This memoizes the parse result keyed by the sidecar's
 # (path, mtime_ns, size, ctime_ns) stat signature: a warm projection re-stats
 # each file (~1 stat) instead of re-reading+parsing it, while any genuine
@@ -6473,7 +6475,7 @@ def _reload_cli_sessions_after_inflight(
 
 def _cli_sessions_cache_ttl_seconds() -> float:
     # #4842: widen the freshness window while a turn is streaming so the fixed
-    # ~5s streaming poll cadence doesn't force a rebuild on every poll. Paired
+    # streaming poll cadence doesn't force a rebuild on every poll. Paired
     # with the streaming-freeze cache key (so the key is stable across polls
     # mid-stream), this bounds the heavy CLI/cron projection to one rebuild per
     # streaming-TTL window instead of one per poll. Mirrors the route-level
@@ -6631,8 +6633,9 @@ def _cli_sessions_streaming_freeze_marker():
     in-app structural mutation invalidates the cache directly via
     ``clear_cli_sessions_cache``. Externally-driven changes that don't fire that
     listener (a scheduled cron completing, an external CLI writing rows) surface
-    within one streaming-TTL window (≤30s) rather than instantly — a bounded,
-    self-healing lag that is the deliberate latency/CPU trade-off of the freeze. (#4842)
+    after the streaming TTL expires and a subsequent refresh occurs rather than
+    instantly — a bounded, self-healing lag that is the deliberate latency/CPU
+    trade-off of the freeze. (#4842)
     """
     try:
         active = _active_stream_ids()
@@ -6672,9 +6675,9 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
     # #4842: while a turn streams, freeze the volatile state.db component of the
     # key so per-message writes don't bust the CLI cache and re-run the heavy
     # CLI/cron projection on every poll (mirrors the route-level #4808 freeze).
-    # The wider streaming TTL in get_cli_sessions() still forces a periodic
-    # rebuild so a streaming session's own count stays fresh within that window,
-    # and structural mutations invalidate via clear_cli_sessions_cache().
+    # The wider streaming TTL in get_cli_sessions() still permits a periodic
+    # rebuild after that window, and structural mutations invalidate via
+    # clear_cli_sessions_cache().
     _streaming_marker = _cli_sessions_streaming_freeze_marker()
     db_state_key = _streaming_marker if _streaming_marker is not None else _sqlite_file_stat_cache_key(db_path)
     cache_key = (
