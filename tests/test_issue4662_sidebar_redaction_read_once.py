@@ -65,3 +65,28 @@ def test_sidebar_payload_no_redaction_when_disabled(monkeypatch):
     resp = routes._session_list_payload_to_response(payload)
     assert resp["sessions"][0]["title"] == "plain title"
     assert calls["n"] <= 1, f"settings read {calls['n']}x with redaction disabled; expected <=1"
+
+
+def test_sidebar_payload_redacts_display_and_parent_titles(monkeypatch):
+    """#6056 derives a delegated subagent's display_title from raw user-message
+    content, so display_title / _state_db_title / parent_title must go through the
+    SAME redaction as title — a credential in a delegated goal must not leak to
+    the sidebar even though only `title` was redacted before."""
+    monkeypatch.setattr("api.config.load_settings", lambda: {"api_redact_enabled": True})
+    monkeypatch.setattr("api.helpers.load_settings", lambda: {"api_redact_enabled": True}, raising=False)
+    monkeypatch.setattr(routes, "_session_list_cache_overlay_runtime_rows", lambda rows: rows)
+
+    secret = "sk-" + ("A" * 44)
+    payload = {"sessions": [{
+        "session_id": "s1",
+        "title": "clean",
+        "display_title": f"debug {secret}",
+        "_state_db_title": f"goal {secret}",
+        "parent_title": f"parent {secret}",
+    }], "cli_count": 0}
+    resp = routes._session_list_payload_to_response(payload)
+    row = resp["sessions"][0]
+    for field in ("display_title", "_state_db_title", "parent_title"):
+        assert secret not in str(row.get(field, "")), (
+            f"credential leaked into sidebar {field}: {row.get(field)!r}"
+        )

@@ -9632,6 +9632,20 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
     }
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
+    # display_title / _state_db_title can carry raw user-message-derived text
+    # (e.g. #6056 derives a delegated subagent's sidebar title from its first
+    # user message), so they must go through the SAME redaction as title — a
+    # credential-shaped value in a delegated goal would otherwise leak to the
+    # sidebar even with api_redact_enabled=True.
+    if isinstance(item.get("display_title"), str):
+        item["display_title"] = _redact_text(item["display_title"], _enabled=redact_enabled)
+    if isinstance(item.get("_state_db_title"), str):
+        item["_state_db_title"] = _redact_text(item["_state_db_title"], _enabled=redact_enabled)
+    # parent_title is a copied parent-session title that surfaces in the sidebar
+    # lineage collapse; redact it on the same path so a parent whose title was
+    # itself user-content-derived can't leak through the child row.
+    if isinstance(item.get("parent_title"), str):
+        item["parent_title"] = _redact_text(item["parent_title"], _enabled=redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
     return item
 
