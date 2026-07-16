@@ -6305,13 +6305,21 @@ def _adopt_session_db_for_cached_agent(agent, new_session_db):
         try:
             new_session_db.close()
         except Exception:
-            pass
+            # Same observability as _replace_session_db_in_kwargs: a failed
+            # close here reintroduces the EMFILE pressure PR #1421 fixed.
+            logger.debug(
+                "Failed to close unused session_db handle in adopt helper",
+                exc_info=True,
+            )
         return existing
     if existing is not None:
         try:
             existing.close()
         except Exception:
-            pass
+            logger.debug(
+                "Failed to close previous session_db handle in adopt helper",
+                exc_info=True,
+            )
     agent._session_db = new_session_db
     return new_session_db
 

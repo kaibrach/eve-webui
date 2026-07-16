@@ -72,6 +72,13 @@ def test_adopt_and_is_open_helpers_exist():
         "_replace_session_db_in_kwargs must guard on _session_db_is_open so "
         "credential self-heal cannot close a handle live subagents share"
     )
+    # adopt helper must log failed closes (not bare `pass`) so EMFILE pressure
+    # from a failed close is diagnosable — matches _replace_session_db_in_kwargs.
+    adopt_idx = src.find("def _adopt_session_db_for_cached_agent")
+    assert adopt_idx != -1
+    adopt_block = src[adopt_idx : adopt_idx + 1800]
+    assert 'Failed to close unused session_db handle in adopt helper' in adopt_block
+    assert "logger.debug" in adopt_block
 
 
 # ── 2: source-level pin: LRU eviction path still closes _session_db ────────
@@ -161,32 +168,22 @@ class _MockAgent:
 
 
 def _import_adopt_helpers():
-    """Import the helpers without pulling in the whole streaming module graph.
+    """Import the production helpers.
 
-    streaming.py has heavy import-time side effects; exec the helper bodies
-    from source so unit tests stay hermetic.
+    No source-slicing / exec fallback: that path breaks as soon as the helpers
+    reference module-level names (e.g. ``logger.debug``) or another def is
+    inserted between the markers. Prefer a real import; skip the behavioral
+    suite when the package cannot be imported (CI without full deps).
+    Source-level pins above still catch reverts without importing streaming.
     """
-    import importlib.util
-    import types
-
-    # Prefer real import when the package is importable.
     try:
         from api.streaming import (  # type: ignore
             _adopt_session_db_for_cached_agent,
             _session_db_is_open,
         )
-        return _session_db_is_open, _adopt_session_db_for_cached_agent
-    except Exception:
-        pass
-
-    src = (REPO / "api" / "streaming.py").read_text(encoding="utf-8")
-    # Extract just the two helper defs by line slicing between markers.
-    start = src.index("def _session_db_is_open")
-    end = src.index("def _build_session_db_for_stream")
-    blob = src[start:end]
-    ns: dict = {}
-    exec(blob, ns)  # noqa: S102 — test-only extraction of pure helpers
-    return ns["_session_db_is_open"], ns["_adopt_session_db_for_cached_agent"]
+    except Exception as exc:
+        pytest.skip(f"api.streaming helpers not importable: {exc}")
+    return _session_db_is_open, _adopt_session_db_for_cached_agent
 
 
 def test_adopt_reuses_open_session_db_and_closes_new():
