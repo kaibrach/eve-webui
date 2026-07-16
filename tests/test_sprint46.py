@@ -129,6 +129,38 @@ def test_session_compress_requires_session_id(cleanup_test_sessions):
     assert handler.payload()["error"] == "Missing required field(s): session_id"
 
 
+def test_session_compress_stale_runtime_returns_typed_409_before_mutation(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    loaded_before = Session.load(sid)
+    assert loaded_before is not None
+    before = loaded_before.compact()
+    monkeypatch.setattr(
+        routes,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("restart required")
+        ),
+    )
+
+    handler = _FakeHandler()
+    _handle_session_compress(handler, {"session_id": sid})
+
+    assert handler.status == 409
+    assert handler.payload() == {
+        "error": "restart required",
+        "type": "agent_runtime_stale",
+        "retryable": True,
+    }
+    loaded_after = Session.load(sid)
+    assert loaded_after is not None
+    assert loaded_after.compact() == before
+
+
 def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     created = cleanup_test_sessions
     original_messages = [

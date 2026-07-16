@@ -371,6 +371,152 @@ def test_runner_owned_start_run_does_not_enter_local_stream_barrier(monkeypatch)
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("gateway_owned", [False, True])
+def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gateway_owned):
+    """The barrier and worker must share one immutable backend decision."""
+    from api import routes
+    from api import turn_journal
+    from api.config import unregister_stream_owner
+
+    gateway_reads = []
+    revision_checks = []
+    worker_targets = []
+    session = types.SimpleNamespace(
+        session_id="gateway-snapshot",
+        profile=None,
+        title="Gateway snapshot",
+        active_stream_id=None,
+        pending_started_at=None,
+    )
+
+    def read_gateway(_cfg):
+        gateway_reads.append(True)
+        if len(gateway_reads) > 1:
+            raise AssertionError("gateway ownership was re-read after admission")
+        return gateway_owned
+
+    def prepare(current, **kwargs):
+        current.active_stream_id = kwargs["stream_id"]
+        current.pending_started_at = 123.0
+
+    class FakeThread:
+        def __init__(self, *, target, args, kwargs, daemon):
+            worker_targets.append(target)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(routes, "webui_gateway_chat_enabled", read_gateway)
+    monkeypatch.setattr(routes, "get_config", lambda: {})
+    monkeypatch.setattr(
+        routes,
+        "ensure_agent_runtime_current",
+        lambda: revision_checks.append(True),
+    )
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda _sid: None)
+    monkeypatch.setattr(routes, "_is_hidden_empty_session", lambda _session: False)
+    monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", prepare)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda _workspace: None)
+    monkeypatch.setattr(routes.threading, "Thread", FakeThread)
+    monkeypatch.setattr(turn_journal, "append_turn_journal_event", lambda *_args, **_kwargs: {})
+
+    response = routes._start_chat_stream_for_session(
+        session,
+        msg="goal",
+        attachments=[],
+        workspace="/tmp/workspace",
+        model="test-model",
+        goal_related=True,
+    )
+
+    try:
+        assert response["session_id"] == session.session_id
+        assert len(gateway_reads) == 1
+        assert revision_checks == ([] if gateway_owned else [True])
+        expected_worker = (
+            routes._run_gateway_chat_streaming
+            if gateway_owned
+            else routes._run_agent_streaming
+        )
+        assert worker_targets == [expected_worker]
+    finally:
+        stream_id = str(response.get("stream_id") or "")
+        with routes.STREAMS_LOCK:
+            routes.STREAMS.pop(stream_id, None)
+        unregister_stream_owner(stream_id)
+        routes.STREAM_GOAL_RELATED.pop(stream_id, None)
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "body"),
+    [
+        ("_handle_git_commit_message", {"session_id": "git-message"}),
+        (
+            "_handle_git_commit_message_selected",
+            {"session_id": "git-message", "paths": ["selected.py"]},
+        ),
+    ],
+)
+def test_git_commit_message_stale_runtime_returns_typed_409(
+    monkeypatch, tmp_path, handler_name, body
+):
+    """Commit-message generation must preserve the stale-runtime contract."""
+    from api import routes
+    from api import workspace_git
+
+    session = types.SimpleNamespace(workspace=str(tmp_path))
+    monkeypatch.setattr(routes, "require", lambda _body, *keys: None)
+    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_git_paths_from_body", lambda _body: ["selected.py"])
+    monkeypatch.setattr(
+        workspace_git,
+        "staged_commit_message_prompt",
+        lambda _workspace: {"system_prompt": "system", "user_prompt": "user"},
+    )
+    monkeypatch.setattr(
+        workspace_git,
+        "selected_commit_message_prompt",
+        lambda _workspace, _paths: {
+            "system_prompt": "system",
+            "user_prompt": "user",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "_llm_git_commit_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("restart required")
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200, **_kwargs: {
+            "status": status,
+            "payload": payload,
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda _handler, message, status=400: {
+            "status": status,
+            "payload": {"error": message},
+        },
+    )
+
+    response = getattr(routes, handler_name)(object(), body)
+
+    assert response == {
+        "status": 409,
+        "payload": {
+            "error": "restart required",
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        },
+    }
+
+
 def test_gateway_owned_start_run_bypasses_local_runtime_barrier(monkeypatch):
     """Gateway chat must reach its worker without inspecting the local Agent."""
     from api import routes

@@ -20782,8 +20782,14 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
     return None
 
 
-def _agent_runtime_barrier_response(*, runner_local_owned: bool = False) -> dict | None:
+def _agent_runtime_barrier_response(
+    *,
+    runner_local_owned: bool = False,
+    external_runtime_owned: bool | None = None,
+) -> dict | None:
     """Return the typed stale-runtime response for local in-process turns."""
+    if external_runtime_owned is True:
+        return None
     if runner_local_owned and webui_gateway_chat_enabled(get_config()):
         return None
     from api.runtime_adapter import runtime_adapter_runner_enabled
@@ -20814,11 +20820,14 @@ def _start_chat_stream_for_session(
     goal_related: bool = False,
     source: str = "webui",
     moa_config=None,
-    external_runtime_owned: bool = False,
+    external_runtime_owned: bool | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
+    if external_runtime_owned is None:
+        external_runtime_owned = webui_gateway_chat_enabled(get_config())
+    backend_is_gateway = bool(external_runtime_owned)
     stale_response = _agent_runtime_barrier_response(
-        runner_local_owned=external_runtime_owned,
+        external_runtime_owned=backend_is_gateway,
     )
     if stale_response is not None:
         stale_response["_status"] = 409
@@ -20941,7 +20950,6 @@ def _start_chat_stream_for_session(
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
-    backend_is_gateway = webui_gateway_chat_enabled(get_config())
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
     worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
     if moa_config and not backend_is_gateway:
@@ -21686,6 +21694,7 @@ def _handle_goal_command(handler, body):
             model_provider=model_provider,
             normalized_model=normalized_model,
             goal_related=True,
+            external_runtime_owned=webui_gateway_chat_enabled(get_config()),
         )
         status = int(stream_response.pop("_status", 200) or 200)
         payload.update(stream_response)
@@ -22737,6 +22746,12 @@ def _handle_git_commit_message(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.exception("git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
@@ -22768,6 +22783,12 @@ def _handle_git_commit_message_selected(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.exception("selected git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
@@ -24230,6 +24251,12 @@ def _handle_session_compress(handler, body):
                 "focus_topic": focus_topic,
             },
         )
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Manual session compression failed: %s", e)
         return bad(handler, f"Compression failed: {_sanitize_error(e)}")
@@ -24879,6 +24906,12 @@ def _handle_handoff_summary(handler, body):
             "rounds": rounds,
             "fallback": fallback,
         })
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Handoff summary generation failed: %s", e)
         summary_text = _fallback_handoff_summary(msgs)
