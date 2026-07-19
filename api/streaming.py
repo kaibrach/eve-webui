@@ -10,7 +10,9 @@ import logging
 import mimetypes
 import os
 import queue
+import random
 import re
+import sqlite3
 import shlex
 import sys
 import subprocess
@@ -37,10 +39,12 @@ from api.config import (
     resolve_model_provider,
     resolve_custom_provider_connection,
     model_with_provider_context,
+    warm_models_catalog_provenance_if_cold,
     load_settings,
     parse_reasoning_effort,
     coerce_reasoning_effort_for_model,
     _main_model_request_overrides,
+    PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
 from api.helpers import redact_session_data, _redact_text
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
@@ -53,10 +57,20 @@ from api.usage import prompt_cache_hit_percent
 from api.models import (
     _is_empty_partial_activity_message,
     _evict_sessions_over_cap,
+    clear_process_wakeup_pause,
     get_state_db_session_messages,
+    record_process_wakeup_provider_unavailable_pause,
     reconciled_state_db_messages_for_session,
 )
 from api.session_ops import mark_session_title_generated, session_has_manual_title
+from api.process_event_utils import (
+    claim_async_delegation_delivery,
+    complete_async_delegation_delivery,
+    completion_delivery_id,
+    release_async_delegation_delivery,
+    requeue_async_delegation_event,
+    schedule_async_delegation_claim_retry,
+)
 
 
 def _session_payload_with_full_messages(session, *, tool_calls=None):
@@ -537,6 +551,48 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
     )
 
 
+def _is_agent_compression_start_status(kind: str, message: str) -> bool:
+    """Return True only for real Hermes context-compression start notices.
+
+    WebUI bridges matching lifecycle statuses into an SSE ``compressing`` event
+    and paints the live "Compressing context" worklog divider. The previous
+    matcher used broad substrings such as ``'compressing' in message`` and
+    ``'preflight compression' in message``, which can false-positive on skip /
+    cooldown / unrelated notices and make brand-new low-token turns look like
+    auto-compression.
+
+    Positive markers below match the agent emitters in hermes-agent
+    (``turn_context`` preflight, ``conversation_loop`` pre-API / 413 / too-large,
+    ``conversation_compression`` compaction status). Explicitly reject skip /
+    defer notices so "Skipping preflight compression…" never surfaces as a
+    running compress divider.
+    """
+    k = str(kind or '').strip().lower()
+    m = str(message or '').strip().lower()
+    if k != 'lifecycle' or not m:
+        return False
+    # Skip / cooldown / defer logs must never look like a live compression start.
+    if (
+        'skipping' in m
+        or 'defer' in m
+        or 'cooldown' in m
+        or 'will not start' in m
+    ):
+        return False
+    # Post-compress retry chatter is not a start event.
+    if 'compressed' in m and 'compressing' not in m and 'compression attempt' not in m:
+        return False
+    return (
+        'preflight compression:' in m
+        or 'pre-api compression:' in m
+        or 'compacting context' in m
+        or 'context too large' in m
+        or '— compressing (' in m
+        or '- compressing (' in m
+        or 'compression attempt' in m
+    )
+
+
 def _prewarm_skill_tool_modules():
     """Import tools.skills_tool and tools.skill_manager_tool outside any lock.
 
@@ -561,10 +617,13 @@ def _prewarm_skill_tool_modules():
 
 
 # Lazy import to avoid circular deps -- hermes-agent is on sys.path via api/config.py
-try:
-    from run_agent import AIAgent
-except ImportError:
-    AIAgent = None
+from api.agent_runtime import ensure_agent_runtime_current, get_ai_agent_class
+
+
+# Eagerly attempt the import at startup, matching the pre-guard behavior. If
+# dependencies are not ready yet, _get_ai_agent() retries when a chat starts.
+AIAgent = get_ai_agent_class()
+
 
 def _get_ai_agent():
     """Return AIAgent class, retrying the import if the initial attempt failed.
@@ -572,15 +631,13 @@ def _get_ai_agent():
     auto_install_agent_deps() in server.py may install missing packages after
     this module is first imported (common in Docker with a volume-mounted agent).
     Re-attempting the import here picks up the newly installed packages without
-    requiring a server restart.
+    requiring a server restart. The shared runtime guard also refuses to reuse
+    cached Agent modules after the source checkout changes.
     """
     global AIAgent
+    ensure_agent_runtime_current()
     if AIAgent is None:
-        try:
-            from run_agent import AIAgent as _cls  # noqa: PLC0415
-            AIAgent = _cls
-        except ImportError:
-            pass
+        AIAgent = get_ai_agent_class()
     return AIAgent
 
 
@@ -634,6 +691,7 @@ WebUI progress guidance:
 - Each update should say what you are about to check, what you just confirmed, or why the next tool call is needed.
 - Keep updates concise, factual, and in the user's language. One or two short sentences are enough.
 - Do not reveal hidden reasoning, chain-of-thought, private scratchpads, secrets, raw logs, or long tool output.
+- Password, API-key, token, and secret fields are automatically redacted by the system. Treat masked values as intentional redaction, not placeholder text or user input errors, and do not tell the user a stored credential is wrong based on a masked value alone.
 - Final visible assistant replies must be clear, user-facing, and in the user's language, not private planning notes.
 - Do not include terse planning fragments or scratchpad shorthand in visible assistant text. Avoid fragments like "Need script", "Need check logs", "Need inspect email", or "maybe invite"; either omit them or rewrite them as clear user-facing progress.
 - For direct answers or very short tasks, skip progress updates and answer normally.
@@ -1791,24 +1849,23 @@ def _set_turn_session_identity(session_id: str):
     """Bind THIS turn's session identity to the current (task/thread-local)
     context and return an opaque token for _reset_turn_session_identity.
 
-    Binds two context-locals so every session-key consumer is covered without
-    a race:
+    Binds three context-locals so every session-key / UI-owner consumer is
+    covered without a race:
       * ``tools.approval._approval_session_key`` — checked FIRST by
         ``get_current_session_key`` (the exact call terminal_tool.py makes for
         a notify_on_complete background spawn: the bug path).
       * ``gateway.session_context._SESSION_KEY`` — read by direct
-        ``get_session_env("HERMES_SESSION_KEY")`` consumers (e.g. the sudo
-        password cache scope, terminal_tool.py:272).
+        ``get_session_env("HERMES_SESSION_KEY")`` consumers.
+      * ``gateway.session_context._SESSION_UI_SESSION_ID`` — exact browser-tab
+        return address stamped onto ProcessSession.origin_ui_session_id and
+        completion events by modern hermes-agent builds. Authoritative for
+        wakeup routing when present (see ``_resolve_completion_target``).
 
     It deliberately does NOT call ``gateway.session_context.set_session_vars``:
     that blanket setter also zeroes the platform/chat_id/user contextvars,
     flipping ``HERMES_SESSION_PLATFORM`` from its env fallback (``'webui'``,
     still written to os.environ at turn-start) to an explicit ``""`` — which
-    would break the ``notify_on_complete`` watcher registration gate in
-    terminal_tool.py:~1966. Only the session-key identity is bound; every
-    other session var keeps its existing os.environ fallback (CLI/cron compat
-    preserved — when these contextvars are _UNSET, get_session_env still falls
-    back to os.environ).
+    would break the ``notify_on_complete`` watcher registration gate.
     """
     sid = str(session_id or "")
     tokens: dict = {}
@@ -1822,6 +1879,11 @@ def _set_turn_session_identity(session_id: str):
         tokens["session_key"] = _SK.set(sid)
     except Exception:
         logger.debug("per-turn _SESSION_KEY bind failed", exc_info=True)
+    try:
+        from gateway.session_context import _SESSION_UI_SESSION_ID as _UI_SID
+        tokens["ui_session_id"] = _UI_SID.set(sid)
+    except Exception:
+        logger.debug("per-turn _SESSION_UI_SESSION_ID bind failed", exc_info=True)
     return tokens
 
 
@@ -1836,6 +1898,13 @@ def _reset_turn_session_identity(tokens) -> None:
     """
     if not tokens:
         return
+    tok = tokens.get("ui_session_id")
+    if tok is not None:
+        try:
+            from gateway.session_context import _SESSION_UI_SESSION_ID as _UI_SID
+            _UI_SID.reset(tok)
+        except Exception:
+            logger.debug("per-turn _SESSION_UI_SESSION_ID reset failed", exc_info=True)
     tok = tokens.get("session_key")
     if tok is not None:
         try:
@@ -1898,6 +1967,14 @@ def _format_process_notification(evt: dict) -> str:
     """Format a completed background process notification for agent input."""
     if not isinstance(evt, dict):
         return ''
+    if evt.get('type') == 'async_delegation':
+        try:
+            from tools.process_registry import format_process_notification
+
+            return format_process_notification(evt) or ''
+        except Exception:
+            logger.debug("Failed to format async delegation notification", exc_info=True)
+            return ''
     if evt.get('type') != 'completion':
         return ''
     _sid = evt.get('session_id', '')
@@ -1922,7 +1999,31 @@ def _mark_process_completion_consumed(process_registry, process_id: str) -> None
         logger.debug("Failed to mark process completion consumed", exc_info=True)
 
 
-def _drain_webui_process_notifications(session_id: str) -> list[str]:
+def _completion_event_targets_webui_session(evt_session_key: str, session_id: str) -> bool:
+    """Return whether a completion event belongs to this WebUI session.
+
+    WebUI normally registers ``PROCESS_SESSION_INDEX[session_id] = session_id``.
+    Gateway/agent session keys can differ, so match the direct WebUI case first
+    and otherwise resolve through the same session-key index used by the
+    background wakeup path.
+    """
+    if not evt_session_key or not session_id:
+        return False
+    if evt_session_key == session_id:
+        return True
+    try:
+        with PROCESS_SESSION_INDEX_LOCK:
+            return PROCESS_SESSION_INDEX.get(evt_session_key) == session_id
+    except Exception:
+        logger.debug("Failed to resolve completion event session key", exc_info=True)
+        return False
+
+
+def _drain_webui_process_notifications(
+    session_id: str,
+    *,
+    pending_async_acceptances: list | None = None,
+) -> list[str]:
     """Return completion notifications that belong to this WebUI session.
 
     The agent registry completion queue is process-wide and events do not carry
@@ -1938,6 +2039,7 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
 
     notifications: list[str] = []
     skipped_events: list[dict] = []
+    async_retry_events: list[tuple[dict, bool]] = []
     completion_queue = getattr(process_registry, 'completion_queue', None)
     if completion_queue is None:
         return []
@@ -1955,44 +2057,142 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
             logger.debug("Failed to drain process completion queue", exc_info=True)
             break
 
-        evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
+        evt_sid = completion_delivery_id(evt) if isinstance(evt, dict) else ''
         if not evt_sid:
             skipped_events.append(evt)
             continue
+        is_async_delegation = (
+            isinstance(evt, dict) and evt.get('type') == 'async_delegation'
+        )
         try:
-            if process_registry.is_completion_consumed(evt_sid):
+            if (
+                not is_async_delegation
+                and process_registry.is_completion_consumed(evt_sid)
+            ):
                 continue
-            proc = process_registry.get(evt_sid)
+            evt_session_key = str(evt.get('session_key') or '') if isinstance(evt, dict) else ''
+            evt_origin_ui_session_id = (
+                str(evt.get('origin_ui_session_id') or '') if isinstance(evt, dict) else ''
+            )
+            if not evt_session_key or not evt_origin_ui_session_id:
+                proc = process_registry.get(evt_sid)
+                if not evt_session_key:
+                    evt_session_key = str(getattr(proc, 'session_key', '') or '')
+                if not evt_origin_ui_session_id:
+                    evt_origin_ui_session_id = (
+                        str(getattr(proc, 'origin_ui_session_id', '') or '')
+                        or str(getattr(proc, 'spawn_session_id', '') or '')
+                    )
         except Exception:
-            proc = None
-        if getattr(proc, 'session_key', None) != session_id:
+            evt_session_key = ''
+            evt_origin_ui_session_id = ''
+
+        # origin_ui_session_id is the exact, immutable return address and is
+        # authoritative over the mutable session-key index (mirrors the
+        # background _process_one path via _resolve_completion_target). When it
+        # is present, this drain claims/ACKs the event ONLY for the origin
+        # session — otherwise the next-turn drain could win the shared-queue
+        # race and deliver+ACK a completion to the wrong (session-key-index)
+        # session, leaving the true origin empty. Fall back to the session-key
+        # target check only for legacy events that carry no origin address.
+        if evt_origin_ui_session_id:
+            if evt_origin_ui_session_id != session_id:
+                skipped_events.append(evt)
+                continue
+        elif not _completion_event_targets_webui_session(evt_session_key, session_id):
             skipped_events.append(evt)
             continue
-
         # Age-gate stale completions: a completion that fires long after the
         # user moved on must not be prepended to an unrelated later turn
         # (nesquena/hermes-webui#4029). Drop (consume, do not requeue) any
         # completion whose enqueue time is older than the configured cap.
         # Events without a 'completed_at' (older agent builds) are never
         # dropped here, preserving backward-compatible behavior.
+        is_stale = False
+        stale_age = 0.0
         if stale_completion_max_age > 0 and isinstance(evt, dict):
             completed_at = evt.get('completed_at')
             if isinstance(completed_at, (int, float)) and completed_at > 0:
-                age = time.time() - completed_at
-                if age > stale_completion_max_age:
-                    logger.info(
-                        "Dropping stale background-process completion for "
-                        "session %s (age %.0fs > cap %.0fs)",
-                        evt_sid, age, stale_completion_max_age,
+                stale_age = time.time() - completed_at
+                is_stale = stale_age > stale_completion_max_age
+
+        if is_async_delegation:
+            try:
+                claim = claim_async_delegation_delivery(evt, "webui-next-turn")
+            except Exception:
+                skipped_events.append(evt)
+                continue
+            if claim is None:
+                schedule_async_delegation_claim_retry(evt, completion_queue)
+                continue
+            notification_added = False
+            try:
+                if is_stale:
+                    notification = ''
+                else:
+                    notification = _format_process_notification(evt)
+                    if not notification:
+                        raise ValueError(
+                            "async delegation formatter returned an empty notification"
+                        )
+                if notification:
+                    notifications.append(notification)
+                    notification_added = True
+                if is_stale:
+                    # Stale async events are an explicit terminal disposition.
+                    complete_async_delegation_delivery(evt, claim)
+                elif pending_async_acceptances is not None:
+                    pending_async_acceptances.append(
+                        (evt, claim, notification, completion_queue)
                     )
-                    _mark_process_completion_consumed(process_registry, evt_sid)
-                    continue
+                else:
+                    # Direct callers without a live agent turn retain the
+                    # historical synchronous acceptance behavior used by
+                    # CLI-style drains.
+                    complete_async_delegation_delivery(evt, claim)
+            except Exception:
+                if notification_added:
+                    notifications.pop()
+                release_async_delegation_delivery(evt, claim)
+                async_retry_events.append(
+                    (evt, bool(getattr(claim, "durable", False)))
+                )
+                logger.warning(
+                    "Failed to accept async delegation completion for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+                continue
+            if is_stale:
+                logger.info(
+                    "Dropping stale async-delegation completion for session %s "
+                    "(age %.0fs > cap %.0fs)",
+                    evt_sid, stale_age, stale_completion_max_age,
+                )
+            continue
+
+        if is_stale:
+            logger.info(
+                "Dropping stale background-process completion for "
+                "session %s (age %.0fs > cap %.0fs)",
+                evt_sid, stale_age, stale_completion_max_age,
+            )
+            _mark_process_completion_consumed(process_registry, evt_sid)
+            continue
 
         notification = _format_process_notification(evt)
         if notification:
             notifications.append(notification)
-            _mark_process_completion_consumed(process_registry, evt_sid)
+        # Matched but unformattable process completions are consumed rather than
+        # replayed forever on later turns.
+        _mark_process_completion_consumed(process_registry, evt_sid)
 
+    for evt, durable in async_retry_events:
+        requeue_async_delegation_event(
+            evt,
+            completion_queue,
+            durable=durable,
+        )
     for evt in skipped_events:
         try:
             completion_queue.put(evt)
@@ -2000,6 +2200,32 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
             logger.debug("Failed to requeue process completion event", exc_info=True)
             break
     return notifications
+
+
+def _accept_pending_async_delegations(
+    pending_async_acceptances: list,
+    *,
+    session_id: str,
+) -> list[str]:
+    """ACK turn-bound delegation claims and return rejected notifications."""
+    rejected_notifications: list[str] = []
+    for evt, claim, notification, completion_queue in pending_async_acceptances:
+        try:
+            complete_async_delegation_delivery(evt, claim)
+        except Exception:
+            release_async_delegation_delivery(evt, claim)
+            requeue_async_delegation_event(
+                evt,
+                completion_queue,
+                durable=bool(getattr(claim, "durable", False)),
+            )
+            rejected_notifications.append(notification)
+            logger.warning(
+                "Async delegation was not accepted into session %s; retrying later",
+                session_id,
+                exc_info=True,
+            )
+    return rejected_notifications
 
 
 def _attachment_name(att) -> str:
@@ -2562,6 +2788,15 @@ def _looks_invalid_generated_title(text: str) -> bool:
     )
 
 
+def _message_content_part_text(part) -> str:
+    """Extract visible text from a structured content part."""
+    if not isinstance(part, dict):
+        return ''
+    return str(
+        part.get('text') or part.get('content') or part.get('input_text') or part.get('output_text') or ''
+    )
+
+
 def _message_text(value) -> str:
     """Extract plain text from mixed message content payloads."""
     if isinstance(value, list):
@@ -2571,9 +2806,47 @@ def _message_text(value) -> str:
                 continue
             ptype = str(p.get('type') or '').lower()
             if ptype in ('', 'text', 'input_text', 'output_text'):
-                parts.append(str(p.get('text') or p.get('content') or ''))
+                parts.append(_message_content_part_text(p))
         return _strip_thinking_markup('\n'.join(parts).strip())
     return _strip_thinking_markup(str(value or '').strip())
+
+
+def _assistant_content_part_is_tool_use(part) -> bool:
+    """Return True when a content[] part represents a tool invocation boundary."""
+    if not isinstance(part, dict):
+        return False
+    part_type = str(part.get('type') or '').lower()
+    if part_type in {'tool_use', 'tool_call'}:
+        return True
+    if part_type:
+        return False
+    if _message_content_part_text(part).strip():
+        return False
+    return any(key in part for key in ('tool_use_id', 'tool_call_id', 'call_id')) and any(
+        key in part for key in ('name', 'tool_name', 'input', 'args')
+    )
+
+
+def _assistant_message_has_final_visible_text(message) -> bool:
+    """Return True when an assistant row carries a settled visible answer."""
+    if not isinstance(message, dict) or message.get('role') != 'assistant':
+        return False
+    content = message.get('content', '')
+    if isinstance(content, list):
+        last_tool_idx = -1
+        for idx, part in enumerate(content):
+            if _assistant_content_part_is_tool_use(part):
+                last_tool_idx = idx
+        if last_tool_idx >= 0:
+            tail_parts = content[last_tool_idx + 1:]
+            return bool(_message_text(tail_parts).strip())
+        if message.get('tool_calls'):
+            return False
+        return bool(_message_text(content).strip())
+    if message.get('tool_calls'):
+        return False
+    return bool(_message_text(content).strip())
+
 
 
 _WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
@@ -4220,6 +4493,9 @@ def _deduplicate_context_messages(messages):
                 msg['role'] = 'assistant'
             deduped.append(msg)
             continue
+        if _is_compressed_context_tool_result_summary_message(msg) and not msg.get('tool_call_id'):
+            deduped.append(msg)
+            continue
         key = _message_identity(msg)
         if key is not None and key in seen:
             continue
@@ -4269,6 +4545,107 @@ def _assign_stable_message_ids(result_messages, *existing_arrays):
     return stamped
 
 
+_POST_COMPRESSION_TOOL_RESULT_TOTAL_TOKENS = 4096
+_POST_COMPRESSION_TOOL_RESULT_MIN_SNIPPET_TOKENS = 256
+_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG = "_webui_pruned_tool_result_summary"
+_POST_COMPRESSION_TOOL_RESULT_MARKER = "[WebUI compressed-context budget:"
+_ROUGH_TOKEN_CHARS = 4
+
+
+def _positive_int_value(value, default: int = 0) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _rough_text_token_count(text: str) -> int:
+    text = str(text or "")
+    if not text:
+        return 0
+    return max(1, (len(text) + (_ROUGH_TOKEN_CHARS - 1)) // _ROUGH_TOKEN_CHARS)
+
+
+def _post_compression_tool_result_budget(compressor) -> int:
+    budget = _positive_int_value(
+        getattr(compressor, 'tail_token_budget', None),
+        _POST_COMPRESSION_TOOL_RESULT_TOTAL_TOKENS,
+    )
+    threshold = _positive_int_value(getattr(compressor, 'threshold_tokens', None), 0)
+    if threshold:
+        budget = min(budget, max(512, threshold // 2))
+    return max(512, budget)
+
+
+def _compressed_context_tool_result_summary(text: str, *, original_tokens: int, keep_tokens: int) -> str:
+    text = str(text or "")
+    keep_chars = max(0, int(keep_tokens or 0) * _ROUGH_TOKEN_CHARS)
+    note_prefix = f"{_POST_COMPRESSION_TOOL_RESULT_MARKER} omitted "
+    note_suffix = (
+        f" (~{int(original_tokens or 0)} rough tokens) from this tool result; "
+        "the full output remains in the visible transcript/tool log.]"
+    )
+    if keep_chars < (_POST_COMPRESSION_TOOL_RESULT_MIN_SNIPPET_TOKENS * _ROUGH_TOKEN_CHARS):
+        return f"{note_prefix}{len(text)} chars{note_suffix}"
+    note_len_for_budget = len(f"{note_prefix}{len(text)} of {len(text)} chars{note_suffix}")
+    snippet_limit = max(0, keep_chars - note_len_for_budget - 2)
+    snippet = text[:snippet_limit].rstrip()
+    if not snippet:
+        return f"{note_prefix}{len(text)} chars{note_suffix}"
+    omitted_chars = max(0, len(text) - len(snippet))
+    note = f"{note_prefix}{omitted_chars} of {len(text)} chars{note_suffix}"
+    return f"{snippet}\n\n{note}"
+
+
+def _is_compressed_context_tool_result_summary_message(msg) -> bool:
+    if not isinstance(msg, dict) or msg.get('role') != 'tool':
+        return False
+    return msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is True
+
+
+def _hard_prune_post_compression_tool_results(messages, *, compressor=None):
+    if not messages:
+        return messages, 0
+    budget = _post_compression_tool_result_budget(compressor)
+    raw_tool_tokens = 0
+    replacements = []
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, dict) or msg.get('role') != 'tool':
+            continue
+        content = msg.get('content', '')
+        text = _raw_message_text(content)
+        if not text.strip():
+            continue
+        token_count = _rough_text_token_count(text)
+        if _is_compressed_context_tool_result_summary_message(msg):
+            raw_tool_tokens += token_count
+            continue
+        remaining = max(0, budget - raw_tool_tokens)
+        if token_count <= remaining:
+            raw_tool_tokens += token_count
+            continue
+        replacements.append((idx, text, token_count, remaining))
+        # Once a tool row exceeds the residual budget, older tool rows should
+        # not be allowed to spend that same residual budget again.
+        raw_tool_tokens = budget
+
+    if not replacements:
+        return messages, 0
+
+    pruned = copy.deepcopy(list(messages))
+    for idx, text, token_count, keep_tokens in replacements:
+        msg = pruned[idx]
+        msg['content'] = _compressed_context_tool_result_summary(
+            text,
+            original_tokens=token_count,
+            keep_tokens=keep_tokens,
+        )
+        msg[_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG] = True
+    return pruned, len(replacements)
+
+
 def _prune_context_tool_results_after_compression(agent, context_messages):
     """Run the active compressor's cheap tool-result pruning on model context.
 
@@ -4276,28 +4653,74 @@ def _prune_context_tool_results_after_compression(agent, context_messages):
     before producing the final answer. Those completed tail tool results are
     model-facing context, but they were produced after the compression pass and
     therefore did not go through the compressor's tool-output pruning. Apply the
-    same cheap pruning once more after a confirmed compression event. This keeps
-    the visible transcript untouched while preventing the next turn from seeing
-    raw post-compression tool dumps.
+    same cheap pruning once more after a confirmed compression event, then apply
+    a WebUI hard cap to retained tool-result payloads. This keeps the visible
+    transcript untouched while preventing the next turn from seeing raw
+    post-compression tool dumps that the compressor protected as recent tail.
     """
     if not context_messages:
         return context_messages
     compressor = getattr(agent, 'context_compressor', None)
     prune = getattr(compressor, '_prune_old_tool_results', None)
-    if not callable(prune):
-        return context_messages
+    pruned_messages = context_messages
+    if callable(prune):
+        try:
+            candidate_messages, pruned_count = prune(
+                copy.deepcopy(context_messages),
+                protect_tail_count=getattr(compressor, 'protect_last_n', 20),
+                protect_tail_tokens=getattr(compressor, 'tail_token_budget', None),
+            )
+            if pruned_count:
+                pruned_messages = _deduplicate_context_messages(candidate_messages)
+        except Exception:
+            logger.debug("post-compression context tool-result pruning failed", exc_info=True)
+
+    hard_pruned_messages, hard_pruned_count = _hard_prune_post_compression_tool_results(
+        pruned_messages,
+        compressor=compressor,
+    )
+    if hard_pruned_count:
+        return _deduplicate_context_messages(hard_pruned_messages)
+    return pruned_messages
+
+
+def _estimate_post_compression_context_tokens(agent, context_messages, system_message):
+    """Return a display-only estimate for the prepared post-compression request."""
     try:
-        pruned_messages, pruned_count = prune(
-            copy.deepcopy(context_messages),
-            protect_tail_count=getattr(compressor, 'protect_last_n', 20),
-            protect_tail_tokens=getattr(compressor, 'tail_token_budget', None),
-        )
+        from agent import model_metadata
+
+        messages = context_messages or []
+        tools = getattr(agent, 'tools', None) or None
+        request_estimator = getattr(model_metadata, 'estimate_request_tokens_rough', None)
+        if callable(request_estimator):
+            estimate = request_estimator(messages, system_prompt=system_message or '', tools=tools)
+        else:
+            message_estimator = getattr(model_metadata, 'estimate_messages_tokens_rough', None)
+            if callable(message_estimator):
+                estimate = message_estimator(messages)
+                if system_message:
+                    estimate += message_estimator([{'role': 'system', 'content': system_message}])
+                if tools:
+                    estimate += message_estimator([{'role': 'system', 'content': str(tools)}])
+            else:
+                try:
+                    from agent.context_compressor import _estimate_msg_budget_tokens
+                except ImportError:
+                    return None
+
+                estimate = sum(
+                    _estimate_msg_budget_tokens(message)
+                    for message in messages
+                    if isinstance(message, dict)
+                )
+                if system_message:
+                    estimate += _estimate_msg_budget_tokens({'role': 'system', 'content': system_message})
+                if tools:
+                    estimate += _estimate_msg_budget_tokens({'role': 'system', 'content': str(tools)})
+        return estimate if isinstance(estimate, int) and estimate > 0 else None
     except Exception:
-        logger.debug("post-compression context tool-result pruning failed", exc_info=True)
-        return context_messages
-    if not pruned_count:
-        return context_messages
-    return _deduplicate_context_messages(pruned_messages)
+        logger.debug("post-compression context estimate failed", exc_info=True)
+        return None
 
 
 def _restore_reasoning_metadata(previous_messages, updated_messages):
@@ -4347,6 +4770,11 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
             # with their display counterpart.
             if prev_msg.get('id') is not None and cur_msg.get('id') is None:
                 cur_msg['id'] = prev_msg['id']
+            if (
+                prev_msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is True
+                and cur_msg.get(_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG) is not True
+            ):
+                cur_msg[_POST_COMPRESSION_TOOL_RESULT_SUMMARY_FLAG] = True
             if prev_msg.get('timestamp') and not cur_msg.get('timestamp'):
                 cur_msg['timestamp'] = prev_msg['timestamp']
             elif prev_msg.get('_ts') and not cur_msg.get('_ts') and not cur_msg.get('timestamp'):
@@ -4715,7 +5143,7 @@ def _raw_message_text(value) -> str:
     """
     if isinstance(value, list):
         return ' '.join(
-            str(p.get('text') or p.get('content') or '')
+            _message_content_part_text(p)
             for p in value
             if isinstance(p, dict)
         )
@@ -5090,6 +5518,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     previous_display = [
         m for m in list(previous_display or [])
         if not _is_context_compression_marker(m)
+        and not _is_compressed_context_tool_result_summary_message(m)
     ]
     # Drop Hermes Agent internal verify-loop scaffolding (synthetic "premature
     # done" answer + the "[System: ...verification evidence...]" nudge) before
@@ -5152,6 +5581,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             _message_identity(m)
             for m in previous_context
             if not _is_context_compression_marker(m)
+            and not _is_compressed_context_tool_result_summary_message(m)
         }
         _has_context_only_turns = bool(_context_id_set - _display_id_set)
         if _has_context_only_turns:
@@ -5189,7 +5619,13 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                         for _k in range(_cursor, _j):
                             _ckey = context_keys[_k]
                             _cmsg = previous_context[_k]
-                            if _ckey is not None and _ckey not in _context_inserted and _ckey not in _display_id_set and not _is_context_compression_marker(_cmsg):
+                            if (
+                                _ckey is not None
+                                and _ckey not in _context_inserted
+                                and _ckey not in _display_id_set
+                                and not _is_context_compression_marker(_cmsg)
+                                and not _is_compressed_context_tool_result_summary_message(_cmsg)
+                            ):
                                 _backfilled.append(copy.deepcopy(_cmsg))
                                 _context_inserted.add(_ckey)
                         # Sync multiset: decrement keys consumed by advancing
@@ -5210,7 +5646,13 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                         for _k in range(_cursor, len(context_keys)):
                             _ckey = context_keys[_k]
                             _cmsg = previous_context[_k]
-                            if _ckey is not None and _ckey not in _context_inserted and _ckey not in _display_id_set and not _is_context_compression_marker(_cmsg):
+                            if (
+                                _ckey is not None
+                                and _ckey not in _context_inserted
+                                and _ckey not in _display_id_set
+                                and not _is_context_compression_marker(_cmsg)
+                                and not _is_compressed_context_tool_result_summary_message(_cmsg)
+                            ):
                                 _backfilled.append(copy.deepcopy(_cmsg))
                                 _context_inserted.add(_ckey)
                         _cursor = len(context_keys)
@@ -5223,7 +5665,13 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                 _ckey = context_keys[_cursor]
                 _cmsg = previous_context[_cursor]
                 _cursor += 1
-                if _ckey is not None and _ckey not in _context_inserted and _ckey not in _display_id_set and not _is_context_compression_marker(_cmsg):
+                if (
+                    _ckey is not None
+                    and _ckey not in _context_inserted
+                    and _ckey not in _display_id_set
+                    and not _is_context_compression_marker(_cmsg)
+                    and not _is_compressed_context_tool_result_summary_message(_cmsg)
+                ):
                     _backfilled.append(copy.deepcopy(_cmsg))
                     _context_inserted.add(_ckey)
             if len(_backfilled) > len(previous_display):
@@ -5313,7 +5761,10 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         candidates = candidates[:insert_at] + [current_user_msg] + candidates[insert_at:]
 
     for msg in candidates:
-        if _is_context_compression_marker(msg):
+        if (
+            _is_context_compression_marker(msg)
+            or _is_compressed_context_tool_result_summary_message(msg)
+        ):
             continue
         key = _message_identity(msg)
         is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
@@ -5401,7 +5852,7 @@ def _assistant_reply_added_after_current_turn(result_messages, previous_context,
         isinstance(m, dict)
         and m.get('role') == 'assistant'
         and not m.get('_error')
-        and str(m.get('content') or '').strip()
+        and _assistant_message_has_final_visible_text(m)
         for m in candidates
     )
 
@@ -5419,18 +5870,7 @@ def _session_lacks_final_assistant_answer(messages) -> bool:
         if role == 'tool':
             return True
         if role == 'assistant':
-            content = msg.get('content')
-            if isinstance(content, list):
-                text = '\n'.join(
-                    str(part.get('text') or part.get('content') or '')
-                    for part in content
-                    if isinstance(part, dict)
-                )
-            else:
-                text = str(content or '')
-            if msg.get('tool_calls'):
-                return True
-            if text.strip():
+            if _assistant_message_has_final_visible_text(msg):
                 return False
             continue
         if role == 'user':
@@ -5859,30 +6299,43 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     pending_text = str(getattr(session, 'pending_user_message', None) or '')
     if not pending_text:
         return False
-    normalized_pending = " ".join(pending_text.split())
-    if normalized_pending:
-        for existing in reversed(list(getattr(session, 'messages', None) or [])[-8:]):
-            if not isinstance(existing, dict) or existing.get('role') != 'user':
-                continue
-            existing_text = " ".join(str(existing.get('content') or '').split())
-            if existing_text == normalized_pending:
-                return False
     recovered_ts = int(time.time())
     pending_started_at = getattr(session, 'pending_started_at', None)
     if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
         recovered_ts = int(pending_started_at)
+    pending_source = getattr(session, 'pending_user_source', None) or 'webui'
+    pending_attachments = list(getattr(session, 'pending_attachments', None) or [])
+
+    def is_exact_checkpoint(messages):
+        if not isinstance(messages, list) or not messages:
+            return False
+        existing = messages[-1]
+        if not isinstance(existing, dict) or existing.get('role') != 'user':
+            return False
+        existing_source = existing.get('_source') or 'webui'
+        try:
+            existing_ts = int(existing.get('timestamp'))
+        except (TypeError, ValueError):
+            return False
+        return (
+            _normalize_user_text(existing.get('content')) == _normalize_user_text(pending_text)
+            and existing_ts == recovered_ts
+            and existing_source == pending_source
+            and list(existing.get('attachments') or []) == pending_attachments
+        )
+
+    if is_exact_checkpoint(getattr(session, 'messages', None)):
+        return False
     recovered = {
         'role': 'user',
         'content': pending_text,
         'timestamp': recovered_ts,
         '_recovered': True,
     }
-    pending_source = getattr(session, 'pending_user_source', None)
-    if pending_source and pending_source != 'webui':
+    if pending_source != 'webui':
         recovered['_source'] = pending_source
-    pending_attachments = getattr(session, 'pending_attachments', None)
     if pending_attachments:
-        recovered['attachments'] = list(pending_attachments)
+        recovered['attachments'] = pending_attachments
     session.messages.append(recovered)
     # Mirror to context_messages so the _recovered flag survives the state.db
     # round-trip (#4283).  state.db has no _recovered column, so without this
@@ -5893,14 +6346,8 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     # Placing the mirror here (rather than in _persist_cancelled_turn) covers
     # all three callers: cancel, provider-error, and exception paths.
     ctx = getattr(session, 'context_messages', None)
-    if isinstance(ctx, list) and ctx:
-        rec_text = " ".join(str(recovered.get('content') or '').split())
-        if not any(
-            isinstance(e, dict) and e.get('role') == 'user'
-            and " ".join(str(e.get('content') or '').split()) == rec_text
-            for e in ctx[-8:]
-        ):
-            ctx.append({k: v for k, v in recovered.items() if k != 'timestamp'})
+    if isinstance(ctx, list) and ctx and not is_exact_checkpoint(ctx):
+        ctx.append(dict(recovered))
     # The new user turn is now committed to messages (#3831): advance a positive
     # truncation watermark left over from a prior retry/undo/edit so that
     # merge_session_messages_append_only() still filters out replaced pre-edit
@@ -6040,6 +6487,65 @@ def _last_resort_sync_from_core(session, stream_id, agent_lock):
         )
 
 
+def _session_db_is_open(session_db) -> bool:
+    """True when *session_db* still has a live sqlite connection.
+
+    SessionDB.close() sets ``_conn = None``. Subagents capture the parent's
+    SessionDB object by reference at spawn time (delegate_tool), so closing
+    that object mid-parent-turn makes every subsequent child
+    ``append_message`` fail with
+    ``'NoneType' object has no attribute 'execute'``.
+    """
+    if session_db is None:
+        return False
+    return getattr(session_db, "_conn", None) is not None
+
+
+def _adopt_session_db_for_cached_agent(agent, new_session_db):
+    """Attach a SessionDB to a reused cached agent without breaking subagents.
+
+    Historical behaviour (PR #1421 FD-leak fix): create a fresh SessionDB every
+    stream request and close the previous handle before replacing
+    ``agent._session_db``. That stops EMFILE growth, but a server-side wakeup
+    / new turn for the same parent session will close the shared handle while
+    background subagents are still writing into it.
+
+    Policy now:
+    - If the cached agent already holds an *open* SessionDB, keep it and close
+      the unused new handle (no FD leak; live subagents keep working).
+    - If the existing handle is missing or already closed, adopt *new_session_db*.
+    - If *new_session_db* is None, leave the existing handle alone.
+    """
+    if agent is None:
+        return new_session_db
+    existing = getattr(agent, "_session_db", None)
+    if new_session_db is None:
+        return existing
+    if existing is new_session_db:
+        return existing
+    if _session_db_is_open(existing):
+        try:
+            new_session_db.close()
+        except Exception:
+            # Same observability as _replace_session_db_in_kwargs: a failed
+            # close here reintroduces the EMFILE pressure PR #1421 fixed.
+            logger.debug(
+                "Failed to close unused session_db handle in adopt helper",
+                exc_info=True,
+            )
+        return existing
+    if existing is not None:
+        try:
+            existing.close()
+        except Exception:
+            logger.debug(
+                "Failed to close previous session_db handle in adopt helper",
+                exc_info=True,
+            )
+    agent._session_db = new_session_db
+    return new_session_db
+
+
 def _build_session_db_for_stream(state_db_path):
     """Build a per-request SessionDB handle for WebUI session search.
 
@@ -6048,19 +6554,61 @@ def _build_session_db_for_stream(state_db_path):
     """
     try:
         from hermes_state import SessionDB
-        return SessionDB(db_path=state_db_path)
+        _attempts = 3
+        _last_error = None
+        for _attempt in range(_attempts):
+            try:
+                return SessionDB(db_path=state_db_path)
+            except sqlite3.OperationalError as _db_err:
+                _db_err_text = str(_db_err).lower()
+                if not (
+                    "locked" in _db_err_text or "busy" in _db_err_text
+                ):
+                    raise
+                _last_error = _db_err
+                if _attempt < _attempts - 1:
+                    print(
+                        f"[webui] WARNING: SessionDB init attempt {_attempt + 1}/{_attempts} failed, retrying: {_db_err}",
+                        flush=True,
+                    )
+                    time.sleep(0.05 * (2 ** _attempt) + random.uniform(0, 0.05))
+        raise _last_error or RuntimeError("SessionDB construction exhausted all attempts")
     except Exception as _db_err:
         print(f"[webui] WARNING: SessionDB init failed - session_search will be unavailable: {_db_err}", flush=True)
         return None
 
 
 def _replace_session_db_in_kwargs(agent_kwargs, state_db_path):
-    """Build a fresh SessionDB and replace ``agent_kwargs['session_db']`` safely."""
+    """Build a fresh SessionDB and replace ``agent_kwargs['session_db']`` safely.
+
+    Does not close an existing open handle that may still be shared with live
+    subagents; only replaces when the prior handle is missing or already closed.
+    """
     if not isinstance(agent_kwargs, dict):
         return None
 
     _old_session_db = agent_kwargs.get("session_db")
     _next_session_db = _build_session_db_for_stream(state_db_path)
+    if _next_session_db is None:
+        # Replacement construction failed. Keep the prior handle only if it is
+        # still open (live subagents may hold it by reference); otherwise
+        # degrade cleanly to None — as master did — so the rebuilt agent lazily
+        # reinitialises its SessionDB instead of reusing a closed handle and
+        # failing every persist/search with
+        # "'NoneType' object has no attribute 'execute'".
+        if _session_db_is_open(_old_session_db):
+            return _old_session_db
+        agent_kwargs["session_db"] = None
+        return None
+    if _session_db_is_open(_old_session_db):
+        # Keep the live handle; discard the unused new one.
+        try:
+            if _next_session_db is not _old_session_db:
+                _next_session_db.close()
+        except Exception:
+            logger.debug("Failed to close unused session_db handle during self-heal")
+        agent_kwargs["session_db"] = _old_session_db
+        return _old_session_db
     if _old_session_db is not None and _old_session_db is not _next_session_db:
         try:
             _old_session_db.close()
@@ -6398,6 +6946,8 @@ def _run_agent_streaming(
     When ephemeral=True, session mutations are skipped — used by /btw to get
     a streaming answer without persisting to the parent session.
     """
+    _turn_route_model = model
+    _turn_route_provider = model_provider
     q = STREAMS.get(stream_id)
     if q is None:
         # The stream was cancelled before the worker started; the route layer
@@ -6531,6 +7081,7 @@ def _run_agent_streaming(
             'context_length': 0,
             'threshold_tokens': 0,
             'last_prompt_tokens': 0,
+            'post_compression_context_tokens_estimate': None,
         }
         _session_obj = _current_live_usage_session()
 
@@ -6703,6 +7254,11 @@ def _run_agent_streaming(
                         _usage[_field] = getattr(_session_obj, _field, 0) or 0
                     except Exception:
                         pass
+            _post_compression_estimate = getattr(
+                _session_obj, 'post_compression_context_tokens_estimate', None,
+            )
+            if isinstance(_post_compression_estimate, int) and _post_compression_estimate > 0:
+                _usage['post_compression_context_tokens_estimate'] = _post_compression_estimate
 
         _real_prompt_tokens = int(_usage.get('last_prompt_tokens') or 0)
         _usage['cache_hit_percent'] = prompt_cache_hit_percent(
@@ -6739,16 +7295,18 @@ def _run_agent_streaming(
                 break  # nothing active — stop the ticker
             if _metering_stop.wait(interval):
                 break  # stream was cancelled or ended — exit
-            stats = meter().get_stats()
+            stats = meter().get_stats(stream_id)
             stats['session_id'] = session_id
             stats['usage'] = _live_usage_snapshot()
             put('metering', stats)
 
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
+    _success_writeback_committed = False
+
     def put(event, data):
         # If cancelled, drop all further events except the cancel event itself
-        if cancel_event.is_set() and event not in ('cancel', 'error'):
+        if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'error'):
             return
         event_id = None
         if run_journal is not None:
@@ -6775,28 +7333,41 @@ def _run_agent_streaming(
         except Exception:
             logger.debug("Failed to put event to queue")
 
+    # #5940: capture a terminal (non-retryable) provider error the Agent emits via
+    # its lifecycle status_callback. The Agent aborts a non-retryable API error
+    # (e.g. HTTP 400 "invalid model / no credentials") with
+    # `_emit_status("❌ Non-retryable error (HTTP <code>): <detail>")` but the run
+    # result / agent._last_error are empty for that path, so turn-completion below
+    # fell through to the misleading `no_response` "silent rate limit, try again"
+    # message. Stash the emitted terminal error here (single-element list = closure
+    # write without nonlocal) so it can seed `_last_err` and let the classifier
+    # surface the real, actionable cause (model_not_found / auth_mismatch).
+    _captured_terminal_error = [None]
+
     def _agent_status_callback(kind, message):
         """Bridge Agent lifecycle status into WebUI SSE.
 
         Passes compression events as 'compressing' events and rate-limit/fallback
         events as 'warning' events so the frontend can surface them to the user.
-        All other lifecycle messages are dropped silently.
+        Also captures a terminal non-retryable provider error (#5940) so the
+        turn-completion classifier can report the real cause instead of the
+        generic no_response fallback. All other lifecycle messages are dropped.
         """
         _message = str(message or '').strip()
         _kind = str(kind or '').strip().lower()
         if not _message:
             return
         _lower = _message.lower()
-        _is_compression_start = (
-            _kind == 'lifecycle'
-            and (
-                'preflight compression' in _lower
-                or 'compressing' in _lower
-                or 'compacting context' in _lower
-                or 'context too large' in _lower
-            )
-        )
-        if _is_compression_start:
+        # #5940: a non-retryable terminal provider error the Agent aborted on. Keep
+        # the FIRST one seen this turn (the original cause; later fallback notices
+        # are handled separately below). Matched on the Agent's emitted shape.
+        if (
+            _captured_terminal_error[0] is None
+            and 'non-retryable error' in _lower
+            and 'http' in _lower
+        ):
+            _captured_terminal_error[0] = _message
+        if _is_agent_compression_start_status(_kind, _message):
             put('compressing', {
                 'session_id': session_id,
                 'message': 'Compressing context',
@@ -6814,6 +7385,7 @@ def _run_agent_streaming(
     # to the `try:` (preserves the Issue #765 static-locator invariant).
     _turn_session_identity_tokens = None
     _streaming_cron_profile_home_token = None
+    _turn_pending_source = 'webui'
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
     # exception fires before the checkpoint thread is created (Issue #765).
@@ -6833,6 +7405,7 @@ def _run_agent_streaming(
         # in the outer finally next to _clear_thread_env().
         _turn_session_identity_tokens = _set_turn_session_identity(session_id)
         s = get_session(session_id)
+        _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         update_active_run(stream_id, phase="running", session_id=session_id)
         s.workspace = str(Path(workspace).expanduser().resolve())
         _last_persisted_model = None
@@ -6954,6 +7527,7 @@ def _run_agent_streaming(
             logger.debug("register_process_session failed", exc_info=True)
         # first-time module initialisation (which can be slow) does not
         # block other concurrent sessions waiting on _ENV_LOCK (#2024).
+        ensure_agent_runtime_current()
         _prewarm_skill_tool_modules()
         _install_streaming_cronjob_profile_wrapper()
         # Still set process-level env as fallback for tools that bypass thread-local
@@ -7150,7 +7724,7 @@ def _run_agent_streaming(
                 if now - _metering_last_emit[0] < 0.1:
                     return
                 _metering_last_emit[0] = now
-                stats = meter().get_stats()
+                stats = meter().get_stats(stream_id)
                 stats['session_id'] = session_id
                 stats['usage'] = _live_usage_snapshot()
                 stats.setdefault('tps_available', False)
@@ -7443,7 +8017,7 @@ def _run_agent_streaming(
                         'preview': preview,
                         'args': args_snap,
                     })
-                    _tool_stats = meter().get_stats()
+                    _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
                     put('metering', _tool_stats)
@@ -7542,7 +8116,7 @@ def _run_agent_streaming(
                         session_id=session_id,
                         stream_id=stream_id,
                     )
-                    _tool_stats = meter().get_stats()
+                    _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
                     put('metering', _tool_stats)
@@ -7574,7 +8148,7 @@ def _run_agent_streaming(
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
                         })
-                    _tool_stats = meter().get_stats()
+                    _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
                     put('metering', _tool_stats)
@@ -7625,7 +8199,7 @@ def _run_agent_streaming(
                             session_id=session_id,
                             stream_id=stream_id,
                         )
-                    _tool_stats = meter().get_stats()
+                    _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
                     put('metering', _tool_stats)
@@ -7639,9 +8213,46 @@ def _run_agent_streaming(
             # Initialize SessionDB so session_search works in WebUI sessions
             _state_db_path = (Path(_profile_home) / "state.db") if _profile_home else None
             _session_db = _build_session_db_for_stream(_state_db_path)
-            resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
-                model_with_provider_context(model, provider_context)
-            )
+            # #5979: publish catalog provenance from the durable disk cache when
+            # memory is cold, so the custom-proxy resolver below sees the
+            # endpoint-advertised model ids (non-blocking, disk-only, never
+            # live-rebuilds). Both the warm and the resolve read profile-keyed
+            # config (cache path + source fingerprint via get_active_profile_name),
+            # but this streaming worker is a separate thread that does NOT inherit
+            # the HTTP handler's request-profile TLS — without binding it, a cold
+            # send from a NAMED profile would resolve against the DEFAULT profile's
+            # config and route to the wrong provider/base_url. Bind the captured
+            # owning-session profile across warm + resolve so both see the right
+            # profile (no-op for the default/root profile).
+            from api import profiles as profiles_api
+            # #5979: treat this send as a deliberate pick ONLY when the persisted
+            # explicit-pick signature matches the CURRENT model+provider routing
+            # context. Storing/comparing a signature (not a bare bool) means a
+            # later model/provider change via /api/chat/start, /api/session/update,
+            # normalization, or provider repair automatically invalidates a stale
+            # pick — so a #433 first-party leftover is never wrongly preserved on
+            # a cold catalog. Only affects the cold custom-proxy branch; warm
+            # endpoint-advertised provenance always wins over this flag.
+            from api.models import model_explicit_pick_signature as _mk_sig
+            _picked_sig = getattr(s, "model_explicit_pick_signature", None)
+            # Compare against the session's persisted model+provider — the exact
+            # fields /api/chat/start stamped the signature from (it persists the
+            # resolved model+provider onto the session before dispatch). Falls
+            # back to the worker's model/provider_context if the session fields
+            # are unset. A mismatch (any later model/provider change) yields a
+            # different signature → treated as NOT a deliberate pick.
+            _sig_model = getattr(s, "model", None) or model
+            _sig_provider = getattr(s, "model_provider", None) or provider_context
+            _current_sig = _mk_sig(_sig_model, _sig_provider)
+            _explicitly_picked = bool(_picked_sig) and _picked_sig == _current_sig
+            with profiles_api.profile_scope_for_detached_worker(
+                _resolved_profile_name, "model resolution", logger_override=logger
+            ):
+                warm_models_catalog_provenance_if_cold()
+                resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
+                    model_with_provider_context(model, provider_context),
+                    explicitly_picked=_explicitly_picked,
+                )
             configured_base_url = resolved_base_url
 
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
@@ -7999,15 +8610,19 @@ def _run_agent_streaming(
                     if 'prefill_messages' in _agent_kwargs and hasattr(agent, 'prefill_messages'):
                         agent.prefill_messages = list(_agent_kwargs.get('prefill_messages') or [])
                     if _session_db is not None:
-                        # Close any previously held SessionDB connection before
-                        # replacing it. Without this, each streaming request creates
-                        # a new SessionDB whose WAL handles leak indefinitely,
-                        # eventually causing EMFILE crashes (#streaming FD leak).
-                        if hasattr(agent, '_session_db') and agent._session_db is not None:
-                            try:
-                                agent._session_db.close()
-                            except Exception:
-                                pass
+                        # Prefer reusing a still-open SessionDB on the cached
+                        # agent. Closing it mid-turn breaks background
+                        # subagents that hold a reference to the same object
+                        # (delegate_tool copies parent._session_db by ref) —
+                        # they then fail with
+                        # 'NoneType' object has no attribute 'execute'.
+                        # When the existing handle is already closed/missing,
+                        # adopt the fresh per-request SessionDB (and close the
+                        # dead one) so we still avoid the EMFILE FD-leak from
+                        # PR #1421.
+                        _session_db = _adopt_session_db_for_cached_agent(
+                            agent, _session_db
+                        )
                         agent._session_db = _session_db
                     if hasattr(agent, '_api_call_count'):
                         agent._api_call_count = 0
@@ -8138,6 +8753,7 @@ def _run_agent_streaming(
                 config_data=_cfg,
             )
             _pending_started_at = getattr(s, 'pending_started_at', None)
+            meter().set_pending_started_at(stream_id, _pending_started_at)
             # Normal chat-start sets pending_started_at before spawning this thread;
             # fallback to now only for recovered/legacy flows where that marker is absent
             # or has been zeroed out (e.g. via a buggy migration / manual file edit).
@@ -8206,7 +8822,11 @@ def _run_agent_streaming(
             )
             _ckpt_thread.start()
 
-            _process_notifications = _drain_webui_process_notifications(session_id)
+            _pending_async_acceptances = []
+            _process_notifications = _drain_webui_process_notifications(
+                session_id,
+                pending_async_acceptances=_pending_async_acceptances,
+            )
             _agent_msg_text = msg_text
             if _process_notifications:
                 _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()
@@ -8230,6 +8850,34 @@ def _run_agent_streaming(
             # run_conversation() predates the moa_config kwarg.
             if moa_config is not None:
                 _run_conversation_kwargs["moa_config"] = moa_config
+
+            # Finalize durable delegation claims at the current-turn acceptance
+            # boundary: immediately before invoking the agent with the message
+            # that contains their notifications. A failed ACK is removed from
+            # this turn and requeued so retry cannot create a duplicate prompt.
+            _rejected_async_notifications = _accept_pending_async_delegations(
+                _pending_async_acceptances,
+                session_id=session_id,
+            )
+            if _rejected_async_notifications:
+                for _notification in _rejected_async_notifications:
+                    try:
+                        _process_notifications.remove(_notification)
+                    except ValueError:
+                        pass
+                _agent_msg_text = msg_text
+                if _process_notifications:
+                    _agent_msg_text = "\n\n".join(
+                        [*_process_notifications, msg_text]
+                    ).strip()
+                user_message = _build_native_multimodal_message(
+                    workspace_ctx,
+                    _agent_msg_text,
+                    attachments,
+                    workspace,
+                    cfg=_cfg,
+                )
+                _run_conversation_kwargs["user_message"] = user_message
             result = agent.run_conversation(**_run_conversation_kwargs)
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
@@ -8544,6 +9192,14 @@ def _run_agent_streaming(
                     msg_text,
                 )
                 _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
+                # #5940: if the Agent aborted on a non-retryable provider error
+                # (captured from its lifecycle status_callback) but left no error on
+                # the result/agent, use the captured message so the classifier can
+                # surface the real cause (model_not_found / auth) instead of the
+                # misleading no_response "silent rate limit, try again" fallback.
+                _captured_terminal_failure = bool(_captured_terminal_error[0])
+                if not _last_err and _captured_terminal_failure:
+                    _last_err = _captured_terminal_error[0]
                 _classification = _classify_provider_error(
                     str(_last_err) if _last_err else '',
                     _last_err,
@@ -8552,7 +9208,8 @@ def _run_agent_streaming(
                 _is_quota = _classification['type'] == 'quota_exhausted'
                 _is_auth = _classification['type'] == 'auth_mismatch'
                 _drop_replayed_assistant = (
-                    _agent_result_terminal_failure(result)
+                    _captured_terminal_failure
+                    or _agent_result_terminal_failure(result)
                     or bool(getattr(agent, '_last_error', None))
                     or ('error' in result and result.get('error') is not None)
                 )
@@ -8566,7 +9223,8 @@ def _run_agent_streaming(
                 )
                 _is_agent_result_terminal = _agent_result_terminal_failure(result)
                 _terminal_failure = (
-                    _is_agent_result_terminal
+                    _captured_terminal_failure
+                    or _is_agent_result_terminal
                     or (
                         _saved_transcript_lacks_final_answer
                         and _classification['type'] not in {'cancelled', 'interrupted'}
@@ -8584,7 +9242,7 @@ def _run_agent_streaming(
                 )
                 if (
                     _terminal_failure
-                    and _soft_partial_terminal_failure
+                    and (_soft_partial_terminal_failure or _tool_limit_reached)
                     and _classification['type'] == 'no_response'
                     and not _saved_transcript_lacks_final_answer
                 ):
@@ -8771,6 +9429,26 @@ def _run_agent_streaming(
                             _err_type,
                             _err_hint,
                         )
+                        if _turn_pending_source == 'process_wakeup':
+                            _recorded_pause = record_process_wakeup_provider_unavailable_pause(
+                                s,
+                                classification=_err_type,
+                                model=_turn_route_model,
+                                provider=_turn_route_provider,
+                            )
+                            # Disclose the suppression so the silence reads as
+                            # intentional, not a stuck agent (#3929 UX) — but ONLY
+                            # when a pause was actually recorded (credential-pool
+                            # exhaustion), never for a rate-limit/other wakeup
+                            # failure that doesn't pause. Keep the SSE payload hint
+                            # in sync with the persisted bubble.
+                            if _recorded_pause:
+                                _err_hint = (
+                                    (_err_hint + ' ' if _err_hint else '')
+                                    + 'Automatic retries for this conversation are paused until you '
+                                    + 'send a message, switch the model/provider, or fix the credentials.'
+                                )
+                                _error_payload['hint'] = _err_hint
                         _materialize_pending_user_turn_before_error(s)
                         s.active_stream_id = None
                         s.pending_user_message = None
@@ -8841,6 +9519,11 @@ def _run_agent_streaming(
                     s.context_messages = _prune_context_tool_results_after_compression(
                         agent,
                         s.context_messages,
+                    )
+                    s.post_compression_context_tokens_estimate = _estimate_post_compression_context_tokens(
+                        agent,
+                        s.context_messages,
+                        workspace_system_msg,
                     )
                     visible_after = visible_messages_for_anchor(s.messages, auto_compression=True)
                     # Find the LAST [CONTEXT COMPACTION] marker in s.messages
@@ -9050,6 +9733,9 @@ def _run_agent_streaming(
                                 _dm['_turnTps'] = _turn_tps
                             if _gateway_routing:
                                 _dm['_gatewayRouting'] = _gateway_routing
+                            _ttft_ms = meter().get_ttft_ms(stream_id)
+                            if _ttft_ms is not None:
+                                _dm['_firstTokenMs'] = _ttft_ms
                             break
                 # Persist context window data on the session so the context-ring
                 # indicator survives a page reload (#1318). Must run BEFORE
@@ -9341,6 +10027,85 @@ def _run_agent_streaming(
                         )
                 except Exception:
                     logger.debug("Failed to sync session to insights")
+            # A late cancel can land during memory/state-sync writeback. Do not
+            # clear a credential-exhausted process-wakeup pause unless this run
+            # is still settling as a normal completion. The pause re-read, clear,
+            # restore, and save must stay under the session lock so a concurrent
+            # suppression cannot observe stale pause state or lose its update.
+            _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
+            with _lock_ctx:
+                if cancel_event.is_set():
+                    _finalize_cancelled_turn(s, ephemeral=False)
+                    try:
+                        append_turn_journal_event_for_stream(
+                            s.session_id,
+                            stream_id,
+                            {
+                                "event": "interrupted",
+                                "created_at": time.time(),
+                                "reason": "cancelled",
+                            },
+                        )
+                    except Exception:
+                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                    return
+                try:
+                    _latest_pause_owner = get_session(getattr(s, 'session_id', session_id))
+                    if _latest_pause_owner is not None:
+                        s = _latest_pause_owner
+                except Exception:
+                    logger.debug(
+                        "Failed to re-read process wakeup pause before success clear",
+                        exc_info=True,
+                    )
+                _process_wakeup_pause_before_clear = dict(getattr(s, 'process_wakeup_pause', {}) or {})
+                if clear_process_wakeup_pause(s, reason='run_completed'):
+                    if cancel_event.is_set():
+                        s.process_wakeup_pause = dict(_process_wakeup_pause_before_clear)
+                        try:
+                            s.save(touch_updated_at=False)
+                        except Exception:
+                            logger.debug("Failed to persist restored process wakeup pause", exc_info=True)
+                        _finalize_cancelled_turn(s, ephemeral=False)
+                        try:
+                            append_turn_journal_event_for_stream(
+                                s.session_id,
+                                stream_id,
+                                {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": "cancelled",
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                        put('cancel', _cancel_event_payload('Cancelled by user'))
+                        return
+                    with _stream_writeback_stage(_writeback_timings, "process_wakeup_pause_clear_save"):
+                        s.save(touch_updated_at=False)
+                    if cancel_event.is_set():
+                        s.process_wakeup_pause = dict(_process_wakeup_pause_before_clear)
+                        try:
+                            s.save(touch_updated_at=False)
+                        except Exception:
+                            logger.debug("Failed to persist restored process wakeup pause", exc_info=True)
+                        _finalize_cancelled_turn(s, ephemeral=False)
+                        try:
+                            append_turn_journal_event_for_stream(
+                                s.session_id,
+                                stream_id,
+                                {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": "cancelled",
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                        put('cancel', _cancel_event_payload('Cancelled by user'))
+                        return
+                _success_writeback_committed = True
             usage = {
                 'input_tokens': input_tokens,
                 'output_tokens': output_tokens,
@@ -9355,6 +10120,9 @@ def _run_agent_streaming(
                 usage['tps'] = _turn_tps
             if _gateway_routing:
                 usage['gateway_routing'] = _gateway_routing
+            _ttft_ms = meter().get_ttft_ms(stream_id)
+            if _ttft_ms is not None:
+                usage['ttft_ms'] = _ttft_ms
             # Include context window data from the agent's compressor for the UI indicator.
             # The session-level persistence happens above (before s.save()) so the values
             # survive a page reload; this block only populates the live SSE usage payload.
@@ -9476,6 +10244,12 @@ def _run_agent_streaming(
                 _sess_lpt = getattr(s, 'last_prompt_tokens', 0) or 0
                 if _sess_lpt:
                     usage['last_prompt_tokens'] = _sess_lpt
+            _post_compression_estimate = getattr(s, 'post_compression_context_tokens_estimate', None)
+            usage['post_compression_context_tokens_estimate'] = (
+                _post_compression_estimate
+                if isinstance(_post_compression_estimate, int) and _post_compression_estimate > 0
+                else None
+            )
             # (reasoning trace already attached + saved above, before s.save())
             # Leftover-steer delivery: if a /steer was queued (via
             # api/chat/steer) but the agent finished its turn before
@@ -9570,7 +10344,7 @@ def _run_agent_streaming(
                     _done_payload['terminal_reason'] = 'max_iterations'
                 put('done', _done_payload)
                 # Emit one last metering packet for the live message-header TPS label.
-                meter_stats = meter().get_stats()
+                meter_stats = meter().get_stats(stream_id)
                 meter_stats['session_id'] = session_id
                 meter_stats.setdefault('tps_available', False)
                 meter_stats.setdefault('estimated', False)
@@ -9663,6 +10437,7 @@ def _run_agent_streaming(
             err_str = _stripped
         _exc_lower = err_str.lower()
         _classification = _classify_provider_error(err_str, e)
+        _exc_is_credential_pool_empty = _classification['type'] == 'credential_pool_empty'
         if cancel_event.is_set():
             if s is not None:
                 if _checkpoint_stop is not None:
@@ -9671,6 +10446,17 @@ def _run_agent_streaming(
                     _ckpt_thread.join(timeout=15)
                 _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
                 with _lock_ctx:
+                    if (
+                        not ephemeral
+                        and _turn_pending_source == 'process_wakeup'
+                        and _exc_is_credential_pool_empty
+                    ):
+                        record_process_wakeup_provider_unavailable_pause(
+                            s,
+                            classification=_classification['type'],
+                            model=_turn_route_model,
+                            provider=_turn_route_provider,
+                        )
                     _finalize_cancelled_turn(s, ephemeral=ephemeral)
                     if not ephemeral:
                         try:
@@ -9688,7 +10474,6 @@ def _run_agent_streaming(
             put('cancel', _cancel_event_payload('Cancelled by user'))
             return
         _exc_is_quota = _classification['type'] == 'quota_exhausted'
-        _exc_is_credential_pool_empty = _classification['type'] == 'credential_pool_empty'
         # Exception quota text still includes: 'more credits' in _exc_lower, 'can only afford' in _exc_lower, 'fewer max_tokens' in _exc_lower.
         # Rate-limit detection remains guarded as: (not _exc_is_quota).
         _exc_is_rate_limit = (_classification['type'] == 'rate_limit') and (not _exc_is_quota)
@@ -9846,6 +10631,22 @@ def _run_agent_streaming(
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
                 if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                    if _turn_pending_source == 'process_wakeup':
+                        _pause = record_process_wakeup_provider_unavailable_pause(
+                            s,
+                            classification=_exc_type,
+                            model=_turn_route_model,
+                            provider=_turn_route_provider,
+                        )
+                        if _pause is not None:
+                            try:
+                                s.save(touch_updated_at=False)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to persist stale-stream process_wakeup pause for session %s",
+                                    getattr(s, 'session_id', session_id),
+                                    exc_info=True,
+                                )
                     logger.info(
                         "Skipping stale stream error writeback for session %s stream %s; active_stream_id=%s",
                         getattr(s, 'session_id', session_id),
@@ -9854,6 +10655,23 @@ def _run_agent_streaming(
                     )
                     return
 
+                if _turn_pending_source == 'process_wakeup':
+                    _recorded_pause = record_process_wakeup_provider_unavailable_pause(
+                        s,
+                        classification=_exc_type,
+                        model=_turn_route_model,
+                        provider=_turn_route_provider,
+                    )
+                    # #3929 UX: disclose the pause in the error card ONLY when a
+                    # pause was actually recorded (credential-pool exhaustion),
+                    # keeping the SSE payload hint in sync with the persisted bubble.
+                    if _recorded_pause:
+                        _exc_hint = (
+                            (_exc_hint + ' ' if _exc_hint else '')
+                            + 'Automatic retries for this conversation are paused until you '
+                            + 'send a message, switch the model/provider, or fix the credentials.'
+                        )
+                        _error_payload['hint'] = _exc_hint
                 _materialize_pending_user_turn_before_error(s)
                 s.active_stream_id = None
                 s.pending_user_message = None

@@ -910,10 +910,12 @@ function _addNamedContextBlock(text){
 
 function _removeNamedContextBlock(id){
   _pendingSelections=_pendingSelections.filter(s=>s.id!==id);
+  if(!_pendingSelections.length)_selectionIdCounter=0;
   _renderSelectionChips();
 }
 
 function _clearPendingSelections(){
+  _selectionIdCounter=0;
   if(!_pendingSelections.length)return false;
   _pendingSelections=[];
   _renderSelectionChips();
@@ -1463,6 +1465,15 @@ async function send(){
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
+      if(_parsedCmd.name==='sessions' || _parsedCmd.name==='resume'){
+        // Open the native WebUI session browser rather than sending as chat text (#6224).
+        // Use the mobile-aware opener so phone-width layouts (where expandSidebar is a
+        // no-op) actually reveal the session drawer.
+        if(typeof _openProfileSwitchSessionBrowser==='function') _openProfileSwitchSessionBrowser();
+        else if(typeof expandSidebar==='function') expandSidebar();
+        if(typeof renderSessionList==='function') await renderSessionList();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
       const _agentCmd=typeof getAgentCommandMetadata==='function'
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
@@ -1552,9 +1563,41 @@ async function send(){
   const activeSid=S.session.session_id;
   _sendInProgressSid=activeSid;
 
-  setComposerStatus(S.pendingFiles&&S.pendingFiles.length?'Uploading…':'');
+  // Salvage of #4750 (@harryazj): capture the composer text and clear the
+  // textarea NOW — immediately after capture and BEFORE the uploadPendingFiles()
+  // / forced-skill-directive awaits below. send() re-reads the LIVE composer when
+  // it is re-entered while a send is in flight (the _sendInProgress guard at the
+  // top of this function reads _composerTextWithPendingSelections()). If we
+  // cleared only after the async work — as the pre-fix code did, down at the
+  // _clearComposerDraft site — a re-entrant/interrupt-mode send during the upload
+  // window would read the still-populated DOM and double-submit the same message.
+  // _submittedDraftTextForClear is the sole authority for the send-time draft
+  // signature from here down; no code path below re-reads $('msg').value on the
+  // happy path.
+  const _submittedDraftTextForClear=$('msg').value||'';
+  $('msg').value='';autoResize();
+
+  // #5912 gate CORE fix: snapshot the pending files that belong to THIS send
+  // BEFORE the await, and upload exactly that snapshot. Otherwise a re-entrant /
+  // interrupt-mode send during the upload window inherits the still-live
+  // S.pendingFiles and later re-uploads the first send's attachment. Detach the
+  // snapshot from S.pendingFiles now so files staged AFTER this point belong to
+  // the next send only.
+  const _submittedFiles=[...(S.pendingFiles||[])];
+  const _submittedDraftFilesForClear=[..._submittedFiles];
+  S.pendingFiles=[];
+  if(typeof renderTray==='function')renderTray();
+
+  // #5912 gate SILENT fix: clear the PERSISTED draft here — alongside the
+  // textarea clear, BEFORE any await — so a new draft typed during the upload
+  // window is not clobbered by a delayed text:'' post. Keep the promise so the
+  // #5472 failed-send restore can chain its re-persist after this clear resolves.
+  let _composerDraftClearPromise=null;
+  if (activeSid && typeof _clearComposerDraft === 'function') _composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);
+
+  setComposerStatus(_submittedFiles.length?'Uploading…':'');
   let uploaded=[];
-  try{uploaded=await uploadPendingFiles();}
+  try{uploaded=await uploadPendingFiles({files:_submittedFiles, sessionId:activeSid, clearPending:false});}
   catch(e){if(!text){setComposerStatus(`Upload error: ${e.message}`);return;}}
   // Clear the uploading status now that upload is done — if we don't clear here
   // it stays visible for the entire duration of the agent stream, since
@@ -1589,18 +1632,13 @@ async function send(){
     }
   }
   if(!msgText){setComposerStatus('Nothing to send');return;}
-  const _submittedDraftTextForClear=$('msg').value||'';
-  const _submittedDraftFilesForClear=Array.isArray(_failedSendFilesSnapshot)?[..._failedSendFilesSnapshot]:[];
-  $('msg').value='';autoResize();
-  // Clear persisted composer draft since message was sent. Capture the promise
-  // so the #5472 failed-send restore can chain its re-persist AFTER this clear
-  // resolves — otherwise the two same-origin POSTs (clear text:'' then restore
-  // text:<draft>) can be reordered under HTTP/2 multiplexing and leave the
-  // server draft empty after a reload. (Opus #5484 NIT.)
-  let _composerDraftClearPromise=null;
-  if (activeSid && typeof _clearComposerDraft === 'function') _composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);
+  // Composer textarea + persisted draft were already captured and cleared
+  // immediately after capture (above, salvage of #4750 + #5912 gate fix) to close
+  // the re-entrant double-send race AND avoid clobbering a draft typed during the
+  // upload window. _composerDraftClearPromise / _submittedDraftFilesForClear are
+  // set there; nothing to re-declare here.
   const displayText=_slashDisplayTextOverride||text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
-  const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
+  const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000,_pending:true};
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
   let optimisticMessages;
@@ -1957,6 +1995,7 @@ function closeLiveStream(sessionId, streamId, source){
         lastAssistantText:INFLIGHT[sessionId].lastAssistantText||'',
         lastReasoningText:INFLIGHT[sessionId].lastReasoningText||'',
         lastRunJournalSeq:INFLIGHT[sessionId].lastRunJournalSeq||0,
+        lastRunJournalEventId:INFLIGHT[sessionId].lastRunJournalEventId||'',
         journalReplayFromStart:true,
         currentActivityBurstId:INFLIGHT[sessionId].currentActivityBurstId||0,
         currentLiveSegmentSeq:INFLIGHT[sessionId].currentLiveSegmentSeq||0,
@@ -2001,6 +2040,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
+  const _priorInflightStreamId=String(INFLIGHT[activeSid].streamId||'');
+  if(_priorInflightStreamId&&_priorInflightStreamId!==streamId){
+    INFLIGHT[activeSid].lastRunJournalSeq=0;
+    INFLIGHT[activeSid].lastRunJournalEventId='';
+  }
+  INFLIGHT[activeSid].streamId=streamId;
   if(!Array.isArray(INFLIGHT[activeSid].activityBurstAnchors)) INFLIGHT[activeSid].activityBurstAnchors=[];
   if(INFLIGHT[activeSid].currentActivityBurstId===undefined) INFLIGHT[activeSid].currentActivityBurstId=0;
   if(INFLIGHT[activeSid].currentLiveSegmentSeq===undefined) INFLIGHT[activeSid].currentLiveSegmentSeq=0;
@@ -2216,6 +2261,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       lastAssistantText:inflight.lastAssistantText||'',
       lastReasoningText:inflight.lastReasoningText||'',
       lastRunJournalSeq:inflight.lastRunJournalSeq||0,
+      lastRunJournalEventId:inflight.lastRunJournalEventId||'',
       journalReplayFromStart:!!inflight.journalReplayFromStart,
       anchorActivityScene:inflight.anchorActivityScene||null,
       currentActivityBurstId:inflight.currentActivityBurstId||0,
@@ -2351,8 +2397,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       burstId:_currentActivityBurstId,
     };
   }
-  function _updateLiveThinkingCard(text){
-    const opts=_liveThinkingPlacement();
+  function _updateLiveThinkingCard(text, options){
+    const opts={
+      ..._liveThinkingPlacement(),
+      ...((options&&typeof options==='object')?options:{}),
+    };
     if(typeof updateThinking==='function') updateThinking(text, opts);
     else appendThinking(text, opts);
   }
@@ -2561,7 +2610,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _lastRunJournalSeq=reconnecting
     ? Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalSeq)||0)
     : 0;
-  let _lastRunJournalEventId='';
+  let _lastRunJournalEventId=reconnecting
+    ? String((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalEventId)||'')
+    : '';
   const _STREAM_FADE_MS=620;
   const _STREAM_FADE_MAX_MS=900;
   const _STREAM_FADE_DONE_MAX_MS=1000;
@@ -2596,13 +2647,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // in-closure SSE handlers). Explicit terminal-path calls above just expire it
   // sooner; this guarantees window._liveAnchorRegistries can't grow unbounded.
   _scheduleAnchorRegistryCleanup(600000);
-  function _applyToAnchor(sourceEventType, rawEventData, sseEvent){
+  // Applying an event and painting it are separate outcomes. Reasoning uses the
+  // optional holder to decide whether a temporary visible fallback is needed.
+  function _applyToAnchor(sourceEventType, rawEventData, sseEvent, renderOutcome){
+    if(renderOutcome&&typeof renderOutcome==='object') renderOutcome.rendered=false;
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return null;
     const raw=(rawEventData&&typeof rawEventData==='object')?rawEventData:{};
     const eventId=(sseEvent&&sseEvent.lastEventId)||raw.event_id||raw.lastEventId||raw.last_event_id||'';
     const sourceEvent={
       ...raw,
       source_event_type:sourceEventType,
+      // Persist a creation timestamp the FIRST time we see this source event, so
+      // the worklog event timestamp (#5700/#5739) survives settlement. Reasoning
+      // events carry no server timestamp; without this, the live DOM shows a
+      // fallback time but the settled scene row rebuilds with created_at:null and
+      // the timestamp disappears. Prefer any real server-supplied stamp; fall back
+      // to now only when none exists. (#5739 gate finding.)
+      created_at:raw.created_at??raw.timestamp??raw.ts??(Date.now()/1000),
       activitySegmentSeq:raw.activitySegmentSeq??raw.activity_segment_seq??_assistantSegmentSeq,
       activityBurstId:raw.activityBurstId??raw.activity_burst_id??_currentActivityBurstId,
     };
@@ -2613,7 +2674,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         sourceEvent,
         {session_id:activeSid,stream_id:streamId}
       );
-      _renderAnchorLiveScene();
+      const rendered=_renderAnchorLiveScene();
+      if(renderOutcome&&typeof renderOutcome==='object') renderOutcome.rendered=rendered;
       return result;
     }catch(err){
       if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
@@ -2710,7 +2772,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return Number.isFinite(seq)&&seq>0?seq:1;
   }
   function _anchorSceneActiveMode(){
-    const normalize=value=>value==='transparent_stream'||value==='compact_worklog'?value:'';
+    const normalize=value=>value==='transparent_stream'||value==='compact_worklog'||value==='hide_all_activity'?value:'';
     if(typeof window!=='undefined'){
       if(typeof window.chatActivityMode==='function'){
         try{
@@ -2730,6 +2792,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       : null;
     if(sceneMode==='transparent_stream') return (hints&&hints.transparent_stream)||'chronological_activity';
     if(sceneMode==='compact_worklog') return (hints&&hints.compact_worklog)||row.display_hint||'activity_row';
+    if(sceneMode==='hide_all_activity') return (hints&&hints.hidden_activity)||'hidden_activity';
     return row&&row.display_hint||'activity_row';
   }
   function _renderAnchorLiveScene(){
@@ -3484,7 +3547,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
     }
     const base=(projectedScene&&typeof projectedScene==='object')?projectedScene:{};
-    const sceneMode=base.mode==='transparent_stream'?'transparent_stream':_anchorSceneActiveMode();
+    const sceneMode=base.mode==='transparent_stream'||base.mode==='hide_all_activity' ? base.mode : _anchorSceneActiveMode();
     const messageFinalAnswer=_anchorSceneFinalAnswerText(lastAsst);
     const finalAnswer=_anchorSceneCleanText(messageFinalAnswer)
       ? messageFinalAnswer
@@ -3495,11 +3558,41 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const rows=[];
     const seen=new Set();
     const seenTextKeys=[];
+    const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
+    const orderedRows=[];
+    for(const row of projectedRows){
+      if(row&&row.role==='terminal') continue;
+      orderedRows.push(row);
+    }
+    for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
+      const bucket=messageRows.get(idx)||[];
+      for(const row of bucket) orderedRows.push(row);
+    }
+    for(const row of projectedRows){
+      if(row&&row.role==='terminal') orderedRows.push(row);
+    }
+    // #5758 gap: final-segment eligibility must be judged against the LIVE
+    // projection's own chronology. The settled per-message tool rows appended
+    // into orderedRows above re-list tools that ran EARLIER in the turn, so an
+    // index over the combined list pushes the "after the last tool row"
+    // boundary past the final segment's live-prose accumulator — its stale
+    // prefix snapshot then survives into the persisted scene and renders as a
+    // duplicate of the answer's beginning. A live-prose row belongs to the
+    // final segment iff no PROJECTED tool row follows it; pre-tool narration
+    // that happens to prefix the final answer stays protected.
+    const lastProjectedToolIndex=projectedRows.reduce((last,row,idx)=>(row&&row.role==='tool')?idx:last,-1);
+    const finalSegmentLiveProseRows=new WeakSet();
+    projectedRows.forEach((row,idx)=>{
+      if(idx>lastProjectedToolIndex&&row&&row.role==='prose'&&row.kind==='process_prose'&&String(row.source_event_type||'')==='token'&&String(row.local_id||'').startsWith('live-prose:')) finalSegmentLiveProseRows.add(row);
+    });
+    const rowIsLiveTokenFinalPrefix=(row,textKey,finalSegmentEligible)=>finalSegmentEligible&&row&&row.role==='prose'&&row.kind==='process_prose'&&String(row.source_event_type||'')==='token'&&String(row.local_id||'').startsWith('live-prose:')&&textKey&&finalKey&&textKey.length<finalKey.length&&finalKey.startsWith(textKey);
     const pushRow=(row)=>{
       if(!row||typeof row!=='object') return;
+      const finalSegmentEligible=finalSegmentLiveProseRows.has(row);
       row=_anchorSceneSettleLiveRunningRow(row,hasSettledThinking);
       if(!row||typeof row!=='object') return;
       const textKey=_anchorSceneTextKey(row.text);
+      if(rowIsLiveTokenFinalPrefix(row,textKey,finalSegmentEligible)) return;
       const isTextual=row.role==='prose'||row.role==='thinking';
       if(isTextual&&_anchorSceneRowLooksLikeFinalAnswer(textKey,finalKey)) return;
       if(isTextual&&_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
@@ -3514,18 +3607,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         seq:rows.length,
       });
     };
-    const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
-    for(const row of projectedRows){
-      if(row&&row.role==='terminal') continue;
-      pushRow(row);
-    }
-    for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
-      const bucket=messageRows.get(idx)||[];
-      for(const row of bucket) pushRow(row);
-    }
-    for(const row of projectedRows){
-      if(row&&row.role==='terminal') pushRow(row);
-    }
+    orderedRows.forEach((row)=>pushRow(row));
     const scene={
       ...base,
       version:'activity_scene_v1',
@@ -3588,6 +3670,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
   }
   function _anchorSceneHasWorklogWorthyRows(scene){
+    if(scene&&scene.mode==='hide_all_activity') return false;
+    if(typeof window!=='undefined'&&typeof window.isFinalAnswerOnlyMode==='function'&&window.isFinalAnswerOnlyMode()) return false;
     // A worklog (the collapsible "已处理 …" rail) is only meaningful when the turn
     // actually DID worklog-worthy work — a tool call, a thinking/reasoning pass, or
     // a compression lifecycle card. A turn that only streamed prose (e.g. a long
@@ -3625,12 +3709,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!lastAsst) return false;
     const projectedScene=_projectLiveAnchorActivityScene();
     const scene=_completeSettledAnchorSceneForTurn(messages,lastAsstIndex,projectedScene);
-    if(scene&&Array.isArray(scene.activity_rows)&&scene.activity_rows.length
-        &&_anchorSceneHasWorklogWorthyRows(scene)){
+    if(scene&&Array.isArray(scene.activity_rows)&&scene.activity_rows.length){
+      const hasWorklogRows=_anchorSceneHasWorklogWorthyRows(scene);
+      const shouldPersistScene=hasWorklogRows||scene.mode==='hide_all_activity';
+      if(!shouldPersistScene) return false;
       lastAsst._anchor_stream_id=streamId;
       lastAsst._anchor_activity_scene=scene;
       _persistSettledAnchorScene(lastAsst, scene, lastAsstIndex);
-      return true;
+      return hasWorklogRows;
     }
     return false;
   }
@@ -3674,7 +3760,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     try{
       let st=_anchorProseSmdCache.get(key);
       // Self-heal desyncs (edit/sanitize made the text no longer a pure append):
-      // rebuild the parser+node from scratch, mirroring _smdWrite's guard.
+      // rebuild the parser+node from scratch, mirroring the _smdWrite guard.
       if(st && st.writtenText && !value.startsWith(st.writtenText)) st=null;
       if(st && st.fade!==fade) st=null;
       if(!st){
@@ -3688,6 +3774,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const baseRenderer=fade?_streamFadeRenderer(body):_safeSmdRenderer(body);
         const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
         st={node,parser:window.smd.parser(renderer),writtenText:'',fade};
+        _smdBindParserIdentity(renderer,st.parser,body);
         _anchorProseSmdCache.set(key,st);
         // Bound memory across turns: keys embed the stream id, so stale entries
         // from finished streams age out here.
@@ -3713,6 +3800,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   window.__anchorProseIncrementalNode=_anchorProseIncrementalNode;
   function _clearAnchorProseIncrementalNode(){
     if(typeof window!=='undefined'&&window.__anchorProseIncrementalNode===_anchorProseIncrementalNode) window.__anchorProseIncrementalNode=null;
+    // Clear the per-parser MEDIA tail for each cached smd parser.
+    // _anchorProseSmdCache is a Map<key, {parser, ...}>; we can't
+    // iterate a WeakMap to clean up, but WeakMap keys become eligible
+    // for GC once the parser objects are released by the cache clear
+    // below, so the WeakMap entries are automatically removed. The
+    // explicit _smdMediaTailClear per-parser is a best-effort guard
+    // for cache entries that may hold the last strong reference.
+    if(typeof _anchorProseSmdCache!=='undefined'&&_anchorProseSmdCache.size){
+      _anchorProseSmdCache.forEach(function(st){
+        if(st&&st.parser&&typeof _smdMediaTailFlush==='function'){
+          _smdMediaTailFlush(st.parser);
+        }
+        if(st&&st.parser&&typeof _smdMediaTailClear==='function'){
+          _smdMediaTailClear(st.parser);
+        }
+      });
+    }
     _anchorProseSmdCache.clear();
   }
   function _anchorHasReasoningEvents(){
@@ -3721,19 +3825,24 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _upsertAnchorReasoning(text, options={}){
     const clean=String(text||'').trim();
-    if(!clean||!_anchorRegistry||window._showThinking===false) return null;
     const placement=_liveThinkingPlacement();
     const segmentSeq=Number(options.segmentSeq||placement.segmentSeq||_anchorSegmentSeq());
     const localId=String(options.localId||`live-reasoning:${streamId}:${segmentSeq}`);
+    if(options&&typeof options==='object'){
+      options.anchorReasoningLocalId=localId;
+      options.segmentSeq=segmentSeq;
+      if(options.burstId===undefined) options.burstId=_currentActivityBurstId;
+    }
+    if(!clean||!_anchorRegistry||window._showThinking===false) return null;
     const existing=_findAnchorActivityEventByLocalId(localId,'reasoning');
     if(existing){
       const replaced=_replaceAnchorActivityEventByLocalId(localId,'reasoning',{
         status:options.sealed?'completed':'running',
         payload:{text:clean,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
       });
-      _renderAnchorLiveScene();
-      return replaced;
+      return _renderAnchorLiveScene()?replaced:null;
     }
+    const renderOutcome={rendered:false};
     _applyToAnchor('reasoning',{
       text:clean,
       local_id:localId,
@@ -3741,8 +3850,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       status:options.sealed?'completed':'running',
       activitySegmentSeq:segmentSeq,
       activityBurstId:_currentActivityBurstId,
-    },null);
-    return _findAnchorActivityEventByLocalId(localId,'reasoning');
+    },null,renderOutcome);
+    return renderOutcome.rendered?_findAnchorActivityEventByLocalId(localId,'reasoning'):null;
   }
   function _compactVisibleEchoText(value){
     return String(value||'').replace(/\s+/g,'');
@@ -3846,8 +3955,38 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(role==='prose'||kind==='process_prose') return 'token';
     if(role==='thinking'||kind==='reasoning') return 'reasoning';
     if(role==='tool') return row&&row.status==='running'?'tool':'tool_complete';
-    if(role==='terminal'||kind==='terminal_status') return row&&row.status==='running'?'compressing':'done';
-    if(role==='lifecycle'||kind==='lifecycle_status') return 'compressing';
+    // Terminal statuses are done/cancel/error/apperror — never invent a
+    // compression start from a running terminal row (false "Compressing context").
+    if(role==='terminal'||kind==='terminal_status'){
+      const termStatus=String(row&&row.status||'').trim().toLowerCase();
+      if(termStatus==='cancelled'||termStatus==='canceled'||termStatus==='interrupted') return 'cancel';
+      if(termStatus==='error'||termStatus==='failed'||termStatus==='errored') return 'error';
+      if(termStatus==='running') return '';
+      return 'done';
+    }
+    // lifecycle_status is shared by compressing + compressed. Prefer explicit
+    // cues; do not default every lifecycle row to a running compress divider.
+    if(role==='lifecycle'||kind==='lifecycle_status'){
+      const phase=String(row&&(row.phase||row.status)||'').trim().toLowerCase();
+      const text=String(row&&(row.text||row.message||row.label)||'').trim().toLowerCase();
+      if(
+        phase==='done'||phase==='completed'||phase==='compressed'
+        || text.includes('auto-compressed')
+        || text.includes('compression finished')
+        || (text.includes('compressed')&&!text.includes('compressing'))
+      ) return 'compressed';
+      if(
+        phase==='running'||phase==='compressing'
+        || text.includes('compressing context')
+        || text.includes('compacting context')
+        || text.includes('preflight compression')
+        || text.includes('pre-api compression')
+        || text.includes('context too large')
+        || text.includes('compression attempt')
+        || (text.includes('compressing')&&!text.includes('skipping'))
+      ) return 'compressing';
+      return '';
+    }
     return '';
   }
   function _hydrateAnchorRegistryFromActivityScene(scene){
@@ -3892,6 +4031,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:row.status||undefined,
         stream_id:row.stream_id||streamId,
         run_id:row.run_id||streamId,
+        // Carry the row's persisted creation timestamp through hydration so the
+        // worklog event timestamp (#5700/#5739) survives a settled-snapshot rebuild
+        // (payload may not carry created_at even when the row does). (#5739 gate.)
+        created_at:payload.created_at??row.created_at??undefined,
       };
       try{
         _anchorApi.applyAssistantTurnAnchorSourceEvent(_anchorRegistry,sourceEvent,{session_id:activeSid,stream_id:streamId,run_id:streamId});
@@ -3988,6 +4131,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const baseRenderer=fade ? _streamFadeRenderer(el) : _safeSmdRenderer(el);
     const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
     _smdParser=window.smd.parser(renderer);
+    _smdBindParserIdentity(renderer,_smdParser,el);
   }
   function _smdRendererWithoutUnderscoreEmphasis(renderer){
     if(!renderer||!window.smd) return renderer;
@@ -4020,13 +4164,24 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(_streamingKatexTimer){clearTimeout(_streamingKatexTimer);_streamingKatexTimer=null;}
     if(_smdParser&&window.smd){
       try{window.smd.parser_end(_smdParser);}catch(_){}
-      // parser_end may flush remaining markdown that creates new links/images —
-      // re-sanitize the body before the DOM is handed off to highlightCode / renderMessages.
-      if(assistantBody){_sanitizeSmdLinks(assistantBody);enhanceMarkdownTables(assistantBody);}
     }
+    // parser_end may emit one final add_text chunk; flush MEDIA tails after it
+    // so a final extensionless URL is rendered before the settled re-render.
+    if(typeof _smdMediaTailFlush==='function') _smdMediaTailFlush(_smdParser);
+    if(typeof _smdMediaTailFlush==='function') _smdMediaTailFlush(__SMD_PARSER_FALLBACK);
+    // parser_end / tail flush may create new links/images — re-sanitize the
+    // body before the DOM is handed off to highlightCode / renderMessages.
+    if(assistantBody){_sanitizeSmdLinks(assistantBody);enhanceMarkdownTables(assistantBody);}
+    // Clear the per-parser MEDIA tail buffer — any incomplete MEDIA
+    // prefix the parser was holding is no longer relevant.
+    if(typeof _smdMediaTailClear==='function') _smdMediaTailClear(_smdParser);
+    if(typeof _smdClearParserIdentity==='function') _smdClearParserIdentity(assistantBody,_smdParser);
     _smdParser=null;
     _smdWrittenLen=0;
     _smdWrittenText='';
+    // Clear the fallback MEDIA tail buffer too; fallback chunks are keyed
+    // by __SMD_PARSER_FALLBACK, not null.
+    if(typeof _smdMediaTailClear==='function') _smdMediaTailClear(__SMD_PARSER_FALLBACK);
   }
   function _scheduleStreamingKatex(){
     if(_streamingKatexTimer) return;
@@ -4064,7 +4219,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // Allowed URL schemes for anchors and images rendered from agent-streamed markdown.
   // Raw file:// anchors are rewritten to /api/media before the user can click them.
   const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|message:|\/|#|\?|\.|api|session\/)/i;
+  // ui.js owns the image-only data URI policy. It loads before this script;
+  // fail closed if that contract is unavailable rather than inventing a second
+  // allowlist that can drift from settled rendering.
   const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
+  function _smdImgSrcAllowed(v){
+    const s=String(v||'');
+    if(/^data:/i.test(s)) return typeof _isSafeDataImageUri==='function'&&_isSafeDataImageUri(s);
+    return _SMD_SAFE_IMG_URL_RE.test(s);
+  }
   function _smdLinkHref(raw){
     const href=String(raw||'');
     if(/^session:\/\//i.test(href)){
@@ -4107,7 +4270,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const _im=root.querySelectorAll('img[src]');
     for(let i=0;i<_im.length;i++){
       const n=_im[i],v=n.getAttribute('src')||'';
-      if(!_SMD_SAFE_IMG_URL_RE.test(v)){n.removeAttribute('src');n.setAttribute('data-blocked-scheme','1');}
+      if(!_smdImgSrcAllowed(v)){n.removeAttribute('src');n.setAttribute('data-blocked-scheme','1');}
     }
   }
 
@@ -4178,12 +4341,33 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const renderer=window.smd.default_renderer(el);
     const baseAddText=renderer.add_text;
     const baseSetAttr=renderer.set_attr;
+    const parserFor = (data)=>{
+      return _smdParserKey(data, el);
+    };
+    const writeFadeText=(writeParent, writeData, writeText)=>{
+      if(!writeParent||_streamFadeSkipNode(writeParent)){
+        _smdAppendPlainText(writeParent, writeData, writeText, baseAddText);
+        return;
+      }
+      _streamFadeAppendText(writeParent, writeText);
+    };
     renderer.add_text=(data,text)=>{
       const parent=data&&data.nodes&&data.nodes[data.index];
       if(!parent||_streamFadeSkipNode(parent)){baseAddText(data,text);return;}
+      // MEDIA-in-stream: if this chunk carries a MEDIA:<ref> token, defer to
+      // the shared interceptor so the token becomes a real media element
+      // instead of plain text. The fade renderer would otherwise wrap every
+      // word in a stream-fade-word span, leaving MEDIA: paths visible.
+      const parser=parserFor(data);
+      const hasMediaTail=!!(_SMD_MEDIA_TAIL&&parser&&_SMD_MEDIA_TAIL.has&&_SMD_MEDIA_TAIL.has(parser));
+      const value=String(text||'');
+      const hasMediaPrefixTail=!!_smdMediaPrefixTail(value);
+      if(/MEDIA:/.test(value)||hasMediaTail||hasMediaPrefixTail){
+        _smdMediaAwareAddText(baseAddText, parent, data, text, _SMD_MEDIA_TAIL, parser, writeFadeText);
+        return;
+      }
       const frag=document.createDocumentFragment();
       const wordRe=/(\S+)(\s*)/g;
-      const value=String(text||'');
       const reduceMotion=_streamFadeReduceMotionEnabled();
       const appendStartedAt=performance.now();
       let last=0, match, changed=false;
@@ -4214,7 +4398,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     renderer.set_attr=(data,attr,value)=>{
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
-      const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
+      const allowed=isSrc?_smdImgSrcAllowed(value):_SMD_SAFE_URL_RE.test(String(value||''));
       if(isHref&&/^(file|workspace|session):\/\//i.test(String(value||''))){
         baseSetAttr(data,attr,_smdLinkHref(value));
         if(/^session:\/\//i.test(String(value||''))){
@@ -4223,7 +4407,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
         return;
       }
-      if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
+      if((isHref||isSrc)&&!allowed){
         const node=data&&data.nodes&&data.nodes[data.index];
         if(node&&node.setAttribute) node.setAttribute('data-blocked-scheme','1');
         return;
@@ -4238,13 +4422,235 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // DOM nodes as plain text nodes (no animation spans). Used on the non-fade
   // streaming path to eliminate _sanitizeSmdLinks(assistantBody) O(DOM) scans
   // on every token event (#WebUI-perf).
+  // MEDIA-in-stream fix: also wraps add_text so MEDIA:<ref> tokens that arrive
+  // mid-turn are converted to inline media elements at insert time, matching
+  // what the full renderMd() pipeline does on the settled assistant message.
+  // Without this, streamed prose shows MEDIA:C:\... as literal text until the
+  // turn settles and the full re-render swaps it for the real <img>.
+  // SAFETY & CROSS-CHUNK SPLITS (Greptile #1 + #2):
+  //   1. Prose slices go back to the owning text writer (text nodes or
+  //      fade spans), NOT through DOMParser — mixed prose with HTML entities /
+  //      malicious <img onerror> stays as literal text.
+  //   2. Each MEDIA token's HTML (from _inlineMediaHtmlForRef) is handed
+  //      to DOMParser one at a time — only trusted markup is parsed.
+  //   3. A MEDIA prefix split across smd flushes (e.g. "MEDIA:" then
+  //      "foo.png") is buffered in a per-parser tail buffer and completed
+  //      on the next add_text call.
+  const _MEDIA_TAIL_MAX = 4096; // bytes; defensive cap on per-parser buffer
+  const _SMD_MEDIA_PREFIX = 'MEDIA:';
+  function _smdMediaPrefixTail(value){
+    const text=String(value||'');
+    const max=Math.min(_SMD_MEDIA_PREFIX.length,text.length);
+    for(let len=max;len>0;len-=1){
+      const suffix=text.slice(text.length-len);
+      if(_SMD_MEDIA_PREFIX.startsWith(suffix)) return suffix;
+    }
+    return '';
+  }
+  function _smdAppendPlainText(parent, data, text, baseAddText){
+    const value=String(text||'');
+    if(parent&&parent.appendChild&&typeof document!=='undefined'&&document.createTextNode){
+      parent.appendChild(document.createTextNode(value));
+      return;
+    }
+    if(baseAddText) baseAddText(data,value);
+  }
+  function _smdMediaWriteText(parent, data, baseAddText, writeText, text){
+    if(writeText){
+      writeText(parent, data, String(text||''));
+      return;
+    }
+    if(baseAddText) baseAddText(data,String(text||''));
+  }
+  function _smdMediaTailSet(tailMap, parser, chunk, parent, baseAddText, data, writeText){
+    if(!tailMap||!parser) return;
+    if(chunk) tailMap.set(parser, {chunk, parent, baseAddText, data, writeText});
+    else tailMap.delete(parser);
+  }
+  function _smdMediaTailEntryChunk(entry){
+    return entry && typeof entry==='object' && Object.prototype.hasOwnProperty.call(entry,'chunk') ? entry.chunk : entry;
+  }
+  function _smdMediaTailSameOwner(entry, parent, baseAddText, writeText){
+    return !!entry && entry.parent===parent && entry.baseAddText===baseAddText && entry.writeText===writeText;
+  }
+  function _smdMediaRefHasReliableBoundary(rawRef){
+    const raw=String(rawRef||'');
+    if(/[?#]$/.test(raw)) return false;
+    const ref=raw.split(/[?#]/,1)[0];
+    return /\.(?:png|jpe?g|gif|webp|bmp|ico|svg|avif|mp4|webm|mov|m4v|mkv|avi|ogv|mp3|wav|ogg|m4a|aac|wma|opus|flac|oga|pdf|html?|csv|diff|patch|excalidraw)$/i.test(ref);
+  }
+  function _smdMediaTailFlushEntry(entry){
+    const chunk=_smdMediaTailEntryChunk(entry);
+    if(!chunk) return;
+    const m=/^MEDIA:([^\s\)\]]+)$/.exec(String(chunk));
+    const emitted=!!(m && entry && entry.parent && _smdAppendMediaNode(entry.parent, m[1]));
+    if(!emitted && entry) _smdMediaWriteText(entry.parent, entry.data, entry.baseAddText, entry.writeText, chunk);
+  }
+  function _smdMediaTailFlush(parser){
+    if(!_SMD_MEDIA_TAIL||!parser||!_SMD_MEDIA_TAIL.get) return;
+    const entry=_SMD_MEDIA_TAIL.get(parser);
+    if(!entry) return;
+    _SMD_MEDIA_TAIL.delete(parser);
+    _smdMediaTailFlushEntry(entry);
+  }
+  function _smdMediaAwareAddText(baseAddText, parent, data, text, tailMap, parser, writeText){
+    const value=String(text||'');
+    const tails=tailMap||(typeof _SMD_MEDIA_TAIL!=='undefined'&&_SMD_MEDIA_TAIL)||null;
+    const writeCurrent=(chunk)=>_smdMediaWriteText(parent, data, baseAddText, writeText, chunk);
+    if(!value){
+      writeCurrent('');
+      return;
+    }
+    // Pull any pending tail from a previous (split) chunk, then clear it;
+    // this call will either complete it, re-buffer it, or flush it as text.
+    let leadEntry = tails && parser && tails.get ? tails.get(parser) : null;
+    let lead = _smdMediaTailEntryChunk(leadEntry);
+    if(lead && !_smdMediaTailSameOwner(leadEntry, parent, baseAddText, writeText)){
+      if(tails && parser && tails.delete) tails.delete(parser);
+      _smdMediaTailFlushEntry(leadEntry);
+      leadEntry=null;
+      lead='';
+    }else if(lead && tails && parser && tails.delete){
+      tails.delete(parser);
+    }
+    const combined = lead ? lead + value : value;
+    // Fast path: no MEDIA tokens in the (possibly combined) string.
+    if(!/MEDIA:/.test(combined)){
+      const prefixTail=_smdMediaPrefixTail(combined);
+      if(prefixTail && tails && parser && prefixTail.length < _MEDIA_TAIL_MAX){
+        const stable=combined.slice(0, combined.length-prefixTail.length);
+        if(stable) writeCurrent(stable);
+        _smdMediaTailSet(tails, parser, prefixTail, parent, baseAddText, data, writeText);
+        return;
+      }
+      writeCurrent(combined);
+      return;
+    }
+    // Walk the combined string, slicing into prose + MEDIA token runs.
+    // Prose runs go through the owning text writer. MEDIA tokens go through
+    // the single-token DOMParser helper only after a delimiter or
+    // reliable filename suffix proves the ref is complete.
+    const re=/MEDIA:([^\s\)\]]+)/g;
+    let last=0, m;
+    let unmatchedTail=null;
+    while((m=re.exec(combined))){
+      const matchEnd = m.index + m[0].length;
+      if(m.index>last){
+        const slice = combined.slice(last, m.index);
+        writeCurrent(slice);
+      }
+      if(matchEnd===combined.length && !_smdMediaRefHasReliableBoundary(m[1])){
+        const candidate = combined.slice(m.index);
+        if(candidate.length < _MEDIA_TAIL_MAX){
+          unmatchedTail = candidate;
+        } else {
+          writeCurrent(candidate);
+        }
+        last = combined.length;
+        break;
+      }
+      if(!_smdAppendMediaNode(parent, m[1])) writeCurrent(m[0]);
+      last = matchEnd;
+    }
+    // Tail buffer — hold trailing bytes that look like an unterminated
+    // MEDIA prefix; flush any prose before the partial MEDIA suffix.
+    const rest = combined.slice(last);
+    if(rest){
+      const tailMatch = /MEDIA:[^\s\)\]]*$/.exec(rest);
+      const prefixTail = tailMatch ? '' : _smdMediaPrefixTail(rest);
+      const tailValue = tailMatch ? tailMatch[0] : prefixTail;
+      if(tailValue && rest.length < _MEDIA_TAIL_MAX){
+        const tailStart = tailMatch ? tailMatch.index : rest.length-prefixTail.length;
+        if(tailStart>0) writeCurrent(rest.slice(0, tailStart));
+        unmatchedTail = tailValue;
+      } else {
+        writeCurrent(rest);
+      }
+    }
+    if(tails && parser){
+      _smdMediaTailSet(tails, parser, unmatchedTail, parent, baseAddText, data, writeText);
+    }
+  }
+  // Single-token DOM splice. Only ever fed the output of
+  // _inlineMediaHtmlForRef (trusted markup fragment). Plain text
+  // goes through baseAddText → createTextNode — NEVER here.
+  function _smdAppendMediaNode(parent, rawRef){
+    if(!parent||!rawRef) return false;
+    const mediaHtml = (typeof _inlineMediaHtmlForRef==='function')
+      ? _inlineMediaHtmlForRef(String(rawRef))
+      : '';
+    if(!mediaHtml) return false;
+    let host=null;
+    try{
+      const doc=new DOMParser().parseFromString('<div>'+mediaHtml+'</div>','text/html');
+      host=doc.body&&doc.body.firstChild;
+    }catch(_){ host=null; }
+    if(!host||!host.childNodes||!host.childNodes.length) return false;
+    const frag=document.createDocumentFragment();
+    while(host.firstChild) frag.appendChild(host.firstChild);
+    parent.appendChild(frag);
+    _smdScheduleMediaPostProcess(parent);
+    return true;
+  }
+  function _smdScheduleMediaPostProcess(root){
+    if(!root) return;
+    if(typeof _postProcessWithAnchorSuppression!=='function'
+      && typeof postProcessRenderedMessages!=='function'
+      && typeof _applyMediaPlaybackPreferences!=='function') return;
+    const run=()=>{
+      try{
+        if(typeof _postProcessWithAnchorSuppression==='function') _postProcessWithAnchorSuppression(root);
+        else if(typeof postProcessRenderedMessages==='function') postProcessRenderedMessages(root);
+        if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(root);
+      }catch(_){}
+    };
+    if(typeof requestAnimationFrame==='function') requestAnimationFrame(run);
+    else if(typeof setTimeout==='function') setTimeout(run,0);
+    else run();
+  }
+  // Per-parser tail buffer keyed by parser instance so concurrent
+  // smd parsers (live prose + anchor-scene rows + tool-card streams)
+  // keep their own pending bytes. Cleared inside _smdEndParser /
+  // _clearAnchorProseIncrementalNode on stream end.
+  const _SMD_MEDIA_TAIL = (typeof WeakMap!=='undefined') ? new WeakMap() : new Map();
+  // Sentinel for parserFor fallback — a dedicated object instead of
+  // a string, so WeakMap.set doesn't throw TypeError when all three
+  // parser-identity sources are unavailable (Greptile #3).
+  const __SMD_PARSER_FALLBACK = {};
+  function _smdParserKey(data, el){
+    return (data && data.parser) || (el && el.__smdParser) || __SMD_PARSER_FALLBACK;
+  }
+  function _smdBindParserIdentity(renderer, parser, el){
+    if(renderer&&renderer.data) renderer.data.parser=parser;
+    if(el) el.__smdParser=parser;
+  }
+  function _smdClearParserIdentity(el, parser){
+    if(!el || (parser && el.__smdParser!==parser)) return;
+    try{delete el.__smdParser;}catch(_){el.__smdParser=null;}
+  }
+  function _smdMediaTailClear(parser){
+    if(_SMD_MEDIA_TAIL && parser) _SMD_MEDIA_TAIL.delete(parser);
+    // Also clear the fallback key if it was ever set
+    if(_SMD_MEDIA_TAIL && parser === __SMD_PARSER_FALLBACK) _SMD_MEDIA_TAIL.delete(parser);
+  }
   function _safeSmdRenderer(el){
     const renderer=window.smd.default_renderer(el);
     const baseSetAttr=renderer.set_attr;
+    const baseAddText=renderer.add_text;
+    const writePlainText=(writeParent, writeData, writeText)=>{
+      _smdAppendPlainText(writeParent, writeData, writeText, baseAddText);
+    };
+    const parserFor = (data)=>{
+      return _smdParserKey(data, el);
+    };
+    renderer.add_text=(data,text)=>{
+      const parent=data&&data.nodes&&data.nodes[data.index];
+      _smdMediaAwareAddText(baseAddText, parent, data, text, _SMD_MEDIA_TAIL, parserFor(data), writePlainText);
+    };
     renderer.set_attr=(data,attr,value)=>{
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
-      const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
+      const allowed=isSrc?_smdImgSrcAllowed(value):_SMD_SAFE_URL_RE.test(String(value||''));
       if(isHref&&/^(file|workspace|session):\/\//i.test(String(value||''))){
         baseSetAttr(data,attr,_smdLinkHref(value));
         if(/^session:\/\//i.test(String(value||''))){
@@ -4253,7 +4659,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
         return;
       }
-      if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
+      if((isHref||isSrc)&&!allowed){
         const node=data&&data.nodes&&data.nodes[data.index];
         if(node&&node.setAttribute) node.setAttribute('data-blocked-scheme','1');
         return;
@@ -4528,6 +4934,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const inflight=INFLIGHT[activeSid];
       if(inflight){
         inflight.lastRunJournalSeq=seq;
+        inflight.lastRunJournalEventId=raw;
         if(typeof _throttledPersist==='function') _throttledPersist();
       }
     }
@@ -5017,16 +5424,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('reasoning',e=>{
       if(_terminalStateReached||_streamFinalized) return;
+      if(!_ownsActiveStreamOrBackground()) return;
       const d=JSON.parse(e.data);
       const text=d.text||'';
       reasoningText += text;
       liveReasoningText += text;
       if(d.text&&S.session&&S.session.session_id===activeSid) _completeAutomaticCompressionOnLiveProgress(activeSid);
       syncInflightAssistantMessage();
-      if(text&&S.session&&S.session.session_id===activeSid){
+      if(text&&S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId){
         const liveThinkingText=_liveThinkingText();
-        if(!_upsertAnchorReasoning(liveThinkingText)){
-          _updateLiveThinkingCard(liveThinkingText);
+        const anchorReasoningFallback={};
+        if(!_upsertAnchorReasoning(liveThinkingText, anchorReasoningFallback)){
+          _updateLiveThinkingCard(liveThinkingText,{
+            ...anchorReasoningFallback,
+            anchorRenderFallback:true,
+            sessionId:activeSid,
+            streamId,
+          });
         }
       }
     });
@@ -5408,7 +5822,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(d.usage){
             const _doneUsageFallback={...(S.lastUsage||{})};
             if(S.session){
-              for(const _usageField of ['context_length','threshold_tokens','last_prompt_tokens']){
+              for(const _usageField of ['context_length','threshold_tokens','last_prompt_tokens','post_compression_context_tokens_estimate']){
                 if(_doneUsageFallback[_usageField]==null&&S.session[_usageField]!=null){
                   _doneUsageFallback[_usageField]=S.session[_usageField];
                 }
@@ -5874,7 +6288,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
             if(st&&st.active){
               setComposerStatus('Reconnected');
-              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{withCredentials:true}));
+              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
             }
             if(st&&st.replay_available){
@@ -6326,16 +6740,36 @@ function autoResize(){
   }
   const el=$('msg');
   const _prevComposerH=el.offsetHeight;
+  // #5514: autoResize() momentarily sets the textarea to height:'auto' (collapses
+  // a multi-row composer toward its 1-row min) before reading scrollHeight and
+  // restoring the measured height. That transient collapse GROWS the flex:1
+  // #messages viewport, and reading scrollHeight forces a synchronous reflow — so
+  // the browser CLAMPS a bottom-anchored scrollTop DOWN by the collapse delta and
+  // does NOT restore it when the height snaps back. The reader is left stranded
+  // Δpx above the bottom on EVERY keystroke while the composer is multi-row (Δ ∝
+  // composer height), and the clamp's async scroll event also sticky-unpins the
+  // reader (_messageUserUnpinned=true), dead-ending the grow-path re-pin below and
+  // stream auto-follow until they manually scroll back. #5516's net-growth gate
+  // never caught this because a steady-state keystroke has no NET height change.
+  // Root-cause fix: snapshot the transcript's scrollTop BEFORE the height
+  // round-trip and restore it AFTER, undoing the transient clamp within the same
+  // synchronous task so the poisoning scroll event never fires. This protects
+  // pinned readers AND near-bottom readers who scrolled up to re-read (their exact
+  // position is preserved), takes no _programmaticScroll latch, and is inert to
+  // iOS dynamic-toolbar reflows. A genuine NET grow/shrink still lands the reader
+  // Δnet off-bottom; the grow-gated re-pin below (and the #composerWrap
+  // ResizeObserver) then snap a still-pinned reader to the true bottom.
+  const _msgs=$('messages');
+  const _prevScrollTop=_msgs?_msgs.scrollTop:0;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,200)+'px';
+  if(_msgs&&_msgs.scrollTop!==_prevScrollTop) _msgs.scrollTop=_prevScrollTop;
   updateSendBtn();
-  // #5514/#5515: growing the composer shrinks the flex:1 transcript viewport, so
-  // a reader pinned to the bottom would be stranded above it ("scrolls up 1 row
-  // per composer row"). Re-pin the transcript when it's genuinely still pinned —
-  // but only when the composer actually GREW (a shrink enlarges the viewport and
-  // can't strand a reader), so the common no-height-change keystroke skips the
-  // re-pin's DOM read entirely. The #composerWrap ResizeObserver is the safety
-  // net for any growth path that doesn't route through here.
+  // Genuine NET growth (a new row that keeps the composer taller than before)
+  // still shrinks the settled viewport, so a pinned reader must be re-pinned to
+  // the true bottom. Guarded to fire only on real growth and only when genuinely
+  // pinned (the helper no-ops for a scrolled-away reader). The #composerWrap
+  // ResizeObserver is the safety net for growth paths that don't route here.
   if(el.offsetHeight>_prevComposerH && typeof _repinMessagesAfterComposerResize==='function') _repinMessagesAfterComposerResize();
 }
 function scheduleComposerAutoResize(){
@@ -7663,7 +8097,11 @@ function showClarifyCard(pending) {
   _clarifySessionId = sid;
   _clarifyId = pending.clarify_id || null;
   _clarifySignature = sig;
-  _startClarifyCountdown(pending);
+  if (Number(pending.timeout_seconds) > 0) {
+    _startClarifyCountdown(pending);
+  } else {
+    _clearClarifyCountdownTimer();
+  }
   if (!sameClarify) {
     _clarifyVisibleSince = Date.now();
     _clearClarifyHideTimer();

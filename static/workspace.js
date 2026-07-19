@@ -242,6 +242,23 @@ function _workspacePathIsReadOnly(path){
 }
 
 function _workspaceRouteForPath(path, kind, opts={}){
+  // Resolve the app-relative "/api/…" route against document.baseURI so the
+  // URLs that are consumed OUTSIDE api() — previewImg.src, the media/pdf/html
+  // frame src, the download anchor, window.open — keep working under a subpath
+  // mount like /hermes/. A bare "/api/…" string resolves to the server root
+  // there and 404s. (api() strips the leading slash and re-resolves against
+  // baseURI itself, so routes passed through it are unaffected by already
+  // being absolute.)
+  const route=_workspaceRouteForPathRel(path, kind, opts);
+  if(!route) return route;
+  // Non-browser test harnesses have no document/location: keep the app-relative form.
+  const base=(typeof document!=='undefined'&&document.baseURI)||(typeof location!=='undefined'&&location.href)||'';
+  if(!base||!/^https?:\/\//i.test(base)) return route;
+  const rel=route.startsWith('/') ? route.slice(1) : route;
+  return new URL(rel, base).href;
+}
+
+function _workspaceRouteForPathRel(path, kind, opts={}){
   if(!S.session) return '';
   const normalizedPath = _normalizeWorkspaceRelPath(path);
   const grant = _workspaceEscapeGrantForPath(normalizedPath);
@@ -569,7 +586,17 @@ function renderSessionArtifacts(){
     if(normWs && p.startsWith(normWs)) return p.slice(normWs.length);
     return p;
   };
-  root.innerHTML = items.map(item => `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-path">${esc(displayPath(item.path))}</div><div class="workspace-artifact-meta">${esc(item.source || 'session')}</div></button>`).join('');
+  root.innerHTML = items.map(item => {
+    const dPath = displayPath(item.path);
+    const idx = dPath.lastIndexOf('/');
+    const fileName = idx >= 0 ? dPath.slice(idx + 1) : dPath;
+    const dirPath = idx >= 0 ? dPath.slice(0, idx) : '';
+    return `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)">
+      <div class="workspace-artifact-name">${esc(fileName)}</div>
+      ${dirPath ? `<div class="workspace-artifact-dir">${esc(dirPath)}</div>` : ''}
+      <div class="workspace-artifact-meta">${esc(item.source || 'session')}</div>
+    </button>`;
+  }).join('');
 }
 
 async function _workspacePathExists(path){
